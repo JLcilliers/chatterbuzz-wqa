@@ -3,18 +3,33 @@ Website Quality Audit (WQA) Generator - FastAPI Web Application
 
 A web-based version of the WQA tool that can be deployed on Vercel.
 Allows users to upload CSV files and receive Excel audit reports.
+Supports Google OAuth for GA4 and GSC data integration.
 """
 
 import io
+import os
+import json
 import logging
+import secrets
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode, quote
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException, Request, Response, Cookie
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+# Google OAuth imports
+try:
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request as GoogleRequest
+    from googleapiclient.discovery import build
+    import httpx
+    GOOGLE_OAUTH_AVAILABLE = True
+except ImportError:
+    GOOGLE_OAUTH_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +38,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="WQA Generator",
     description="Website Quality Audit Generator for SEO Agencies",
-    version="1.0.0"
+    version="2.0.0"
 )
 
 # Add CORS middleware
@@ -34,6 +49,100 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =============================================================================
+# GOOGLE OAUTH CONFIGURATION
+# =============================================================================
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# OAuth scopes needed for GA4 and GSC
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/analytics.readonly",
+    "https://www.googleapis.com/auth/webmasters.readonly",
+    "openid",
+    "email",
+    "profile"
+]
+
+# In-memory token storage (for serverless - tokens stored in encrypted cookies)
+# In production, you'd want to use a database
+token_storage: Dict[str, dict] = {}
+
+def encrypt_token(token_data: dict) -> str:
+    """Simple token encoding for cookie storage"""
+    from itsdangerous import URLSafeTimedSerializer
+    serializer = URLSafeTimedSerializer(SECRET_KEY)
+    return serializer.dumps(token_data)
+
+def decrypt_token(token_string: str) -> Optional[dict]:
+    """Decode token from cookie"""
+    from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+    serializer = URLSafeTimedSerializer(SECRET_KEY)
+    try:
+        return serializer.loads(token_string, max_age=86400)  # 24 hour expiry
+    except (BadSignature, SignatureExpired):
+        return None
+
+def get_google_auth_url(state: str) -> str:
+    """Generate Google OAuth URL"""
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state
+    }
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+
+async def exchange_code_for_tokens(code: str) -> dict:
+    """Exchange authorization code for tokens"""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": GOOGLE_REDIRECT_URI
+            }
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Token exchange failed: {response.text}")
+        return response.json()
+
+async def refresh_access_token(refresh_token: str) -> dict:
+    """Refresh an expired access token"""
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token"
+            }
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Token refresh failed")
+        return response.json()
+
+def get_credentials_from_tokens(tokens: dict) -> Credentials:
+    """Create Google credentials from token dict"""
+    return Credentials(
+        token=tokens.get("access_token"),
+        refresh_token=tokens.get("refresh_token"),
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GOOGLE_SCOPES
+    )
 
 # =============================================================================
 # COLUMN MAPPING CONFIGURATION
@@ -480,6 +589,309 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
 
 
 # =============================================================================
+# GOOGLE API INTEGRATION
+# =============================================================================
+
+async def fetch_ga4_properties(credentials: Credentials) -> List[dict]:
+    """Fetch list of GA4 properties the user has access to"""
+    try:
+        service = build('analyticsadmin', 'v1beta', credentials=credentials)
+        accounts = service.accountSummaries().list().execute()
+
+        properties = []
+        for account in accounts.get('accountSummaries', []):
+            for prop in account.get('propertySummaries', []):
+                properties.append({
+                    'id': prop.get('property', '').replace('properties/', ''),
+                    'name': prop.get('displayName', 'Unknown'),
+                    'account': account.get('displayName', 'Unknown')
+                })
+        return properties
+    except Exception as e:
+        logger.error(f"Error fetching GA4 properties: {e}")
+        return []
+
+async def fetch_ga4_report(credentials: Credentials, property_id: str, days: int = 30) -> pd.DataFrame:
+    """Fetch GA4 page data and return as DataFrame matching CSV format"""
+    try:
+        service = build('analyticsdata', 'v1beta', credentials=credentials)
+
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days)
+
+        request_body = {
+            'dateRanges': [{
+                'startDate': start_date.strftime('%Y-%m-%d'),
+                'endDate': end_date.strftime('%Y-%m-%d')
+            }],
+            'dimensions': [{'name': 'pagePath'}],
+            'metrics': [
+                {'name': 'sessions'},
+                {'name': 'keyEvents'}  # This is GA4's conversion metric
+            ],
+            'limit': 25000
+        }
+
+        response = service.properties().runReport(
+            property=f'properties/{property_id}',
+            body=request_body
+        ).execute()
+
+        rows = []
+        for row in response.get('rows', []):
+            page_path = row['dimensionValues'][0]['value'] if row.get('dimensionValues') else ''
+            sessions = int(row['metricValues'][0]['value']) if row.get('metricValues') else 0
+            conversions = int(row['metricValues'][1]['value']) if len(row.get('metricValues', [])) > 1 else 0
+
+            rows.append({
+                'url': page_path,
+                'sessions': sessions,
+                'conversions': conversions
+            })
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=['url', 'sessions', 'conversions'])
+    except Exception as e:
+        logger.error(f"Error fetching GA4 report: {e}")
+        return pd.DataFrame(columns=['url', 'sessions', 'conversions'])
+
+async def fetch_gsc_sites(credentials: Credentials) -> List[dict]:
+    """Fetch list of verified GSC sites"""
+    try:
+        service = build('searchconsole', 'v1', credentials=credentials)
+        sites = service.sites().list().execute()
+
+        return [
+            {
+                'url': site.get('siteUrl', ''),
+                'permission': site.get('permissionLevel', 'Unknown')
+            }
+            for site in sites.get('siteEntry', [])
+        ]
+    except Exception as e:
+        logger.error(f"Error fetching GSC sites: {e}")
+        return []
+
+async def fetch_gsc_report(credentials: Credentials, site_url: str, days: int = 90) -> pd.DataFrame:
+    """Fetch GSC performance data and return as DataFrame matching CSV format"""
+    try:
+        service = build('searchconsole', 'v1', credentials=credentials)
+
+        end_date = datetime.now() - timedelta(days=3)  # GSC data has ~3 day lag
+        start_date = end_date - timedelta(days=days)
+
+        request_body = {
+            'startDate': start_date.strftime('%Y-%m-%d'),
+            'endDate': end_date.strftime('%Y-%m-%d'),
+            'dimensions': ['page'],
+            'rowLimit': 25000
+        }
+
+        response = service.searchanalytics().query(
+            siteUrl=site_url,
+            body=request_body
+        ).execute()
+
+        rows = []
+        for row in response.get('rows', []):
+            rows.append({
+                'url': row['keys'][0] if row.get('keys') else '',
+                'clicks': row.get('clicks', 0),
+                'impressions': row.get('impressions', 0),
+                'ctr': row.get('ctr', 0),
+                'avg_position': row.get('position', 0)
+            })
+
+        # Also fetch top query per page for primary_keyword
+        query_request = {
+            'startDate': start_date.strftime('%Y-%m-%d'),
+            'endDate': end_date.strftime('%Y-%m-%d'),
+            'dimensions': ['page', 'query'],
+            'rowLimit': 25000
+        }
+
+        try:
+            query_response = service.searchanalytics().query(
+                siteUrl=site_url,
+                body=query_request
+            ).execute()
+
+            # Group by page and get top query by impressions
+            page_keywords = {}
+            for row in query_response.get('rows', []):
+                page = row['keys'][0] if row.get('keys') else ''
+                query = row['keys'][1] if len(row.get('keys', [])) > 1 else ''
+                impressions = row.get('impressions', 0)
+
+                if page not in page_keywords or impressions > page_keywords[page]['impressions']:
+                    page_keywords[page] = {'query': query, 'impressions': impressions}
+
+            # Add primary_keyword to rows
+            for row in rows:
+                if row['url'] in page_keywords:
+                    row['primary_keyword'] = page_keywords[row['url']]['query']
+                else:
+                    row['primary_keyword'] = ''
+        except Exception as e:
+            logger.warning(f"Could not fetch query data: {e}")
+            for row in rows:
+                row['primary_keyword'] = ''
+
+        return pd.DataFrame(rows) if rows else pd.DataFrame(
+            columns=['url', 'clicks', 'impressions', 'ctr', 'avg_position', 'primary_keyword']
+        )
+    except Exception as e:
+        logger.error(f"Error fetching GSC report: {e}")
+        return pd.DataFrame(columns=['url', 'clicks', 'impressions', 'ctr', 'avg_position', 'primary_keyword'])
+
+
+# =============================================================================
+# OAUTH ENDPOINTS
+# =============================================================================
+
+@app.get("/api/auth/google")
+async def google_auth_start(response: Response):
+    """Start Google OAuth flow"""
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI environment variables."
+        )
+
+    state = secrets.token_urlsafe(32)
+    auth_url = get_google_auth_url(state)
+
+    # Store state in cookie for verification
+    redirect = RedirectResponse(url=auth_url, status_code=302)
+    redirect.set_cookie(key="oauth_state", value=state, httponly=True, max_age=600, samesite="lax")
+    return redirect
+
+@app.get("/api/auth/google/callback")
+async def google_auth_callback(
+    request: Request,
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    oauth_state: Optional[str] = Cookie(None)
+):
+    """Handle Google OAuth callback"""
+    if error:
+        return RedirectResponse(url=f"/?error={error}", status_code=302)
+
+    if not code:
+        return RedirectResponse(url="/?error=no_code", status_code=302)
+
+    # Verify state
+    if state != oauth_state:
+        return RedirectResponse(url="/?error=invalid_state", status_code=302)
+
+    try:
+        # Exchange code for tokens
+        tokens = await exchange_code_for_tokens(code)
+
+        # Encrypt tokens for cookie storage
+        encrypted = encrypt_token(tokens)
+
+        # Redirect to app with success
+        redirect = RedirectResponse(url="/?connected=google", status_code=302)
+        redirect.set_cookie(
+            key="google_tokens",
+            value=encrypted,
+            httponly=True,
+            max_age=86400,  # 24 hours
+            samesite="lax",
+            secure=True
+        )
+        redirect.delete_cookie(key="oauth_state")
+        return redirect
+    except Exception as e:
+        logger.error(f"OAuth callback error: {e}")
+        return RedirectResponse(url=f"/?error=auth_failed", status_code=302)
+
+@app.get("/api/auth/status")
+async def auth_status(google_tokens: Optional[str] = Cookie(None)):
+    """Check if user is authenticated with Google"""
+    if not google_tokens:
+        return {"connected": False}
+
+    tokens = decrypt_token(google_tokens)
+    if not tokens:
+        return {"connected": False}
+
+    return {"connected": True, "has_refresh": "refresh_token" in tokens}
+
+@app.post("/api/auth/logout")
+async def logout(response: Response):
+    """Clear Google authentication"""
+    response = JSONResponse({"success": True})
+    response.delete_cookie(key="google_tokens")
+    return response
+
+@app.get("/api/ga4/properties")
+async def list_ga4_properties(google_tokens: Optional[str] = Cookie(None)):
+    """List GA4 properties available to the user"""
+    if not google_tokens:
+        raise HTTPException(status_code=401, detail="Not authenticated with Google")
+
+    tokens = decrypt_token(google_tokens)
+    if not tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    credentials = get_credentials_from_tokens(tokens)
+    properties = await fetch_ga4_properties(credentials)
+    return {"properties": properties}
+
+@app.get("/api/gsc/sites")
+async def list_gsc_sites(google_tokens: Optional[str] = Cookie(None)):
+    """List GSC sites available to the user"""
+    if not google_tokens:
+        raise HTTPException(status_code=401, detail="Not authenticated with Google")
+
+    tokens = decrypt_token(google_tokens)
+    if not tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    credentials = get_credentials_from_tokens(tokens)
+    sites = await fetch_gsc_sites(credentials)
+    return {"sites": sites}
+
+@app.post("/api/ga4/report")
+async def get_ga4_report(
+    property_id: str = Form(...),
+    days: int = Form(30),
+    google_tokens: Optional[str] = Cookie(None)
+):
+    """Fetch GA4 report data"""
+    if not google_tokens:
+        raise HTTPException(status_code=401, detail="Not authenticated with Google")
+
+    tokens = decrypt_token(google_tokens)
+    if not tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    credentials = get_credentials_from_tokens(tokens)
+    df = await fetch_ga4_report(credentials, property_id, days)
+    return {"rows": df.to_dict('records'), "count": len(df)}
+
+@app.post("/api/gsc/report")
+async def get_gsc_report(
+    site_url: str = Form(...),
+    days: int = Form(90),
+    google_tokens: Optional[str] = Cookie(None)
+):
+    """Fetch GSC report data"""
+    if not google_tokens:
+        raise HTTPException(status_code=401, detail="Not authenticated with Google")
+
+    tokens = decrypt_token(google_tokens)
+    if not tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired session")
+
+    credentials = get_credentials_from_tokens(tokens)
+    df = await fetch_gsc_report(credentials, site_url, days)
+    return {"rows": df.to_dict('records'), "count": len(df)}
+
+
+# =============================================================================
 # API ENDPOINTS
 # =============================================================================
 
@@ -502,150 +914,113 @@ async def root():
             padding: 20px;
         }
         .container {
-            max-width: 800px;
+            max-width: 900px;
             margin: 0 auto;
             background: white;
             border-radius: 16px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             padding: 40px;
         }
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            font-size: 2rem;
-        }
-        .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 1.1rem;
-        }
-        .form-section {
-            margin-bottom: 25px;
-        }
+        h1 { color: #333; margin-bottom: 10px; font-size: 2rem; }
+        .subtitle { color: #666; margin-bottom: 30px; font-size: 1.1rem; }
+        .form-section { margin-bottom: 25px; }
         .form-section h3 {
-            color: #444;
-            margin-bottom: 10px;
-            font-size: 1rem;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+            color: #444; margin-bottom: 10px; font-size: 1rem;
+            display: flex; align-items: center; gap: 8px;
         }
         .required { color: #e74c3c; }
         .optional { color: #27ae60; font-size: 0.85rem; }
-        .file-input-wrapper {
-            position: relative;
-            overflow: hidden;
-            display: inline-block;
-            width: 100%;
-        }
+        .file-input-wrapper { position: relative; overflow: hidden; display: inline-block; width: 100%; }
         .file-input-wrapper input[type=file] {
-            font-size: 100px;
-            position: absolute;
-            left: 0;
-            top: 0;
-            opacity: 0;
-            cursor: pointer;
-            width: 100%;
-            height: 100%;
+            font-size: 100px; position: absolute; left: 0; top: 0;
+            opacity: 0; cursor: pointer; width: 100%; height: 100%;
         }
         .file-input-btn {
-            background: #f8f9fa;
-            border: 2px dashed #ddd;
-            border-radius: 8px;
-            padding: 20px;
-            text-align: center;
-            transition: all 0.3s;
-            cursor: pointer;
+            background: #f8f9fa; border: 2px dashed #ddd; border-radius: 8px;
+            padding: 20px; text-align: center; transition: all 0.3s; cursor: pointer;
         }
-        .file-input-btn:hover {
-            border-color: #667eea;
-            background: #f0f0ff;
-        }
-        .file-input-btn.has-file {
-            border-color: #27ae60;
-            background: #e8f8f0;
-        }
-        .file-name {
-            margin-top: 8px;
-            font-size: 0.9rem;
-            color: #27ae60;
-        }
-        .threshold-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 15px;
-            margin-top: 20px;
-        }
-        .threshold-item label {
-            display: block;
-            font-size: 0.85rem;
-            color: #666;
-            margin-bottom: 5px;
-        }
-        .threshold-item input {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            font-size: 1rem;
+        .file-input-btn:hover { border-color: #667eea; background: #f0f0ff; }
+        .file-input-btn.has-file { border-color: #27ae60; background: #e8f8f0; }
+        .file-input-btn.disabled { opacity: 0.5; cursor: not-allowed; }
+        .file-name { margin-top: 8px; font-size: 0.9rem; color: #27ae60; }
+        .threshold-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 15px; margin-top: 20px; }
+        .threshold-item label { display: block; font-size: 0.85rem; color: #666; margin-bottom: 5px; }
+        .threshold-item input, .threshold-item select {
+            width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 1rem;
         }
         .submit-btn {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            padding: 15px 40px;
-            font-size: 1.1rem;
-            border-radius: 8px;
-            cursor: pointer;
-            width: 100%;
-            margin-top: 20px;
+            color: white; border: none; padding: 15px 40px; font-size: 1.1rem;
+            border-radius: 8px; cursor: pointer; width: 100%; margin-top: 20px;
             transition: transform 0.2s, box-shadow 0.2s;
         }
-        .submit-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
-        }
-        .submit-btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        .status {
-            margin-top: 20px;
-            padding: 15px;
-            border-radius: 8px;
-            display: none;
-        }
-        .status.loading {
-            display: block;
-            background: #fff3cd;
-            color: #856404;
-        }
-        .status.success {
-            display: block;
-            background: #d4edda;
-            color: #155724;
-        }
-        .status.error {
-            display: block;
-            background: #f8d7da;
-            color: #721c24;
-        }
+        .submit-btn:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4); }
+        .submit-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+        .status { margin-top: 20px; padding: 15px; border-radius: 8px; display: none; }
+        .status.loading { display: block; background: #fff3cd; color: #856404; }
+        .status.success { display: block; background: #d4edda; color: #155724; }
+        .status.error { display: block; background: #f8d7da; color: #721c24; }
         .info-box {
-            background: #e8f4fd;
-            border-left: 4px solid #667eea;
-            padding: 15px;
-            margin-bottom: 25px;
-            border-radius: 0 8px 8px 0;
+            background: #e8f4fd; border-left: 4px solid #667eea;
+            padding: 15px; margin-bottom: 25px; border-radius: 0 8px 8px 0;
         }
-        .info-box p {
-            color: #444;
-            font-size: 0.9rem;
-            line-height: 1.5;
+        .info-box p { color: #444; font-size: 0.9rem; line-height: 1.5; }
+
+        /* Google OAuth styles */
+        .google-section {
+            background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+            border: 2px solid #dee2e6; border-radius: 12px;
+            padding: 25px; margin-bottom: 30px;
         }
+        .google-section h2 { color: #333; font-size: 1.3rem; margin-bottom: 15px; display: flex; align-items: center; gap: 10px; }
+        .google-btn {
+            display: inline-flex; align-items: center; gap: 10px;
+            background: white; border: 2px solid #4285f4; color: #4285f4;
+            padding: 12px 24px; border-radius: 8px; font-size: 1rem;
+            cursor: pointer; transition: all 0.3s; font-weight: 500;
+        }
+        .google-btn:hover { background: #4285f4; color: white; }
+        .google-btn.connected { background: #34a853; border-color: #34a853; color: white; }
+        .google-btn svg { width: 20px; height: 20px; }
+        .google-status { margin-top: 15px; font-size: 0.9rem; }
+        .google-status.connected { color: #34a853; }
+        .google-status.not-connected { color: #666; }
+        .logout-btn {
+            background: none; border: none; color: #dc3545;
+            cursor: pointer; font-size: 0.85rem; margin-left: 15px;
+            text-decoration: underline;
+        }
+
+        /* Data source toggle */
+        .data-source-toggle {
+            display: flex; gap: 10px; margin-bottom: 15px;
+            background: #f1f3f4; padding: 5px; border-radius: 8px;
+        }
+        .toggle-btn {
+            flex: 1; padding: 10px 15px; border: none; background: transparent;
+            border-radius: 6px; cursor: pointer; font-size: 0.9rem;
+            transition: all 0.2s; color: #666;
+        }
+        .toggle-btn.active { background: white; color: #667eea; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .toggle-btn:hover:not(.active) { background: rgba(255,255,255,0.5); }
+
+        /* Property/site selectors */
+        .api-selector { margin-top: 15px; }
+        .api-selector select {
+            width: 100%; padding: 12px; border: 2px solid #ddd;
+            border-radius: 8px; font-size: 1rem; background: white;
+        }
+        .api-selector select:focus { border-color: #667eea; outline: none; }
+        .api-selector.has-selection select { border-color: #27ae60; }
+        .api-selector label { display: block; font-size: 0.85rem; color: #666; margin-bottom: 8px; }
+        .loading-indicator { color: #666; font-style: italic; padding: 10px 0; }
+
+        .hidden { display: none !important; }
+
         @media (max-width: 600px) {
             .threshold-grid { grid-template-columns: 1fr; }
             .container { padding: 20px; }
+            .data-source-toggle { flex-direction: column; }
         }
     </style>
 </head>
@@ -655,7 +1030,40 @@ async def root():
         <p class="subtitle">Website Quality Audit Report Generator for SEO Agencies</p>
 
         <div class="info-box">
-            <p><strong>How it works:</strong> Upload your crawl data (required) and optionally add GA4, GSC, and backlink data. The tool will merge all data sources, apply SEO rules, and generate a comprehensive Excel report with prioritized actions.</p>
+            <p><strong>How it works:</strong> Upload your crawl data (required) and add GA4/GSC data either by connecting your Google account or uploading CSVs. The tool merges all data sources, applies SEO rules, and generates a comprehensive Excel report with prioritized actions.</p>
+        </div>
+
+        <!-- Google OAuth Section -->
+        <div class="google-section">
+            <h2>
+                <svg viewBox="0 0 24 24" width="24" height="24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+                Connect Google Data
+            </h2>
+            <p style="color: #666; margin-bottom: 15px; font-size: 0.9rem;">Connect your Google account to automatically pull GA4 and Search Console data instead of uploading CSVs.</p>
+
+            <div id="googleAuthSection">
+                <button class="google-btn" id="googleConnectBtn" onclick="window.location.href='/api/auth/google'">
+                    <svg viewBox="0 0 24 24"><path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/></svg>
+                    Connect with Google
+                </button>
+                <div class="google-status not-connected" id="googleStatus">Not connected</div>
+            </div>
+
+            <!-- Property/Site selectors (shown when connected) -->
+            <div id="googleSelectors" class="hidden">
+                <div class="api-selector" id="ga4SelectorWrapper">
+                    <label>GA4 Property</label>
+                    <select id="ga4PropertySelect">
+                        <option value="">-- Select GA4 Property --</option>
+                    </select>
+                </div>
+                <div class="api-selector" id="gscSelectorWrapper" style="margin-top: 15px;">
+                    <label>Search Console Site</label>
+                    <select id="gscSiteSelect">
+                        <option value="">-- Select GSC Site --</option>
+                    </select>
+                </div>
+            </div>
         </div>
 
         <form id="wqaForm" enctype="multipart/form-data">
@@ -670,25 +1078,45 @@ async def root():
                 </div>
             </div>
 
-            <div class="form-section">
+            <!-- GA4 Section with toggle -->
+            <div class="form-section" id="ga4Section">
                 <h3>GA4 Data <span class="optional">(Optional)</span></h3>
-                <div class="file-input-wrapper">
-                    <div class="file-input-btn" id="gaBtn">
-                        <div>Click or drag to upload GA4 CSV</div>
-                        <div class="file-name" id="gaFileName"></div>
+                <div class="data-source-toggle" id="ga4Toggle">
+                    <button type="button" class="toggle-btn active" data-source="csv" onclick="toggleDataSource('ga4', 'csv')">Upload CSV</button>
+                    <button type="button" class="toggle-btn" data-source="api" onclick="toggleDataSource('ga4', 'api')" id="ga4ApiToggle" disabled>Use Google API</button>
+                </div>
+                <div id="ga4CsvUpload">
+                    <div class="file-input-wrapper">
+                        <div class="file-input-btn" id="gaBtn">
+                            <div>Click or drag to upload GA4 CSV</div>
+                            <div class="file-name" id="gaFileName"></div>
+                        </div>
+                        <input type="file" name="ga_file" id="gaFile" accept=".csv">
                     </div>
-                    <input type="file" name="ga_file" id="gaFile" accept=".csv">
+                </div>
+                <div id="ga4ApiInfo" class="hidden" style="padding: 15px; background: #e8f8f0; border-radius: 8px; color: #155724;">
+                    <strong>Using Google API</strong> - Data will be pulled from the selected GA4 property above.
                 </div>
             </div>
 
-            <div class="form-section">
+            <!-- GSC Section with toggle -->
+            <div class="form-section" id="gscSection">
                 <h3>GSC Data <span class="optional">(Optional)</span></h3>
-                <div class="file-input-wrapper">
-                    <div class="file-input-btn" id="gscBtn">
-                        <div>Click or drag to upload GSC CSV</div>
-                        <div class="file-name" id="gscFileName"></div>
+                <div class="data-source-toggle" id="gscToggle">
+                    <button type="button" class="toggle-btn active" data-source="csv" onclick="toggleDataSource('gsc', 'csv')">Upload CSV</button>
+                    <button type="button" class="toggle-btn" data-source="api" onclick="toggleDataSource('gsc', 'api')" id="gscApiToggle" disabled>Use Google API</button>
+                </div>
+                <div id="gscCsvUpload">
+                    <div class="file-input-wrapper">
+                        <div class="file-input-btn" id="gscBtn">
+                            <div>Click or drag to upload GSC CSV</div>
+                            <div class="file-name" id="gscFileName"></div>
+                        </div>
+                        <input type="file" name="gsc_file" id="gscFile" accept=".csv">
                     </div>
-                    <input type="file" name="gsc_file" id="gscFile" accept=".csv">
+                </div>
+                <div id="gscApiInfo" class="hidden" style="padding: 15px; background: #e8f8f0; border-radius: 8px; color: #155724;">
+                    <strong>Using Google API</strong> - Data will be pulled from the selected GSC site above.
                 </div>
             </div>
 
@@ -725,6 +1153,12 @@ async def root():
                 </div>
             </div>
 
+            <!-- Hidden fields for API data source flags -->
+            <input type="hidden" name="use_ga4_api" id="useGa4Api" value="false">
+            <input type="hidden" name="ga4_property_id" id="ga4PropertyId" value="">
+            <input type="hidden" name="use_gsc_api" id="useGscApi" value="false">
+            <input type="hidden" name="gsc_site_url" id="gscSiteUrl" value="">
+
             <button type="submit" class="submit-btn" id="submitBtn">Generate WQA Report</button>
         </form>
 
@@ -732,6 +1166,121 @@ async def root():
     </div>
 
     <script>
+        let isGoogleConnected = false;
+        let ga4DataSource = 'csv';
+        let gscDataSource = 'csv';
+
+        // Check auth status on page load
+        async function checkAuthStatus() {
+            try {
+                const response = await fetch('/api/auth/status');
+                const data = await response.json();
+
+                isGoogleConnected = data.connected;
+                updateGoogleUI();
+
+                if (isGoogleConnected) {
+                    await loadGoogleData();
+                }
+            } catch (error) {
+                console.error('Error checking auth status:', error);
+            }
+        }
+
+        function updateGoogleUI() {
+            const connectBtn = document.getElementById('googleConnectBtn');
+            const status = document.getElementById('googleStatus');
+            const selectors = document.getElementById('googleSelectors');
+            const ga4ApiToggle = document.getElementById('ga4ApiToggle');
+            const gscApiToggle = document.getElementById('gscApiToggle');
+
+            if (isGoogleConnected) {
+                connectBtn.classList.add('connected');
+                connectBtn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg> Connected';
+                status.className = 'google-status connected';
+                status.innerHTML = 'Connected to Google <button class="logout-btn" onclick="logout()">Disconnect</button>';
+                selectors.classList.remove('hidden');
+                ga4ApiToggle.disabled = false;
+                gscApiToggle.disabled = false;
+            } else {
+                connectBtn.classList.remove('connected');
+                connectBtn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/></svg> Connect with Google';
+                status.className = 'google-status not-connected';
+                status.textContent = 'Not connected';
+                selectors.classList.add('hidden');
+                ga4ApiToggle.disabled = true;
+                gscApiToggle.disabled = true;
+            }
+        }
+
+        async function loadGoogleData() {
+            // Load GA4 properties
+            try {
+                const ga4Response = await fetch('/api/ga4/properties');
+                if (ga4Response.ok) {
+                    const ga4Data = await ga4Response.json();
+                    const select = document.getElementById('ga4PropertySelect');
+                    select.innerHTML = '<option value="">-- Select GA4 Property --</option>';
+                    ga4Data.properties.forEach(prop => {
+                        select.innerHTML += `<option value="${prop.id}">${prop.name} (${prop.account})</option>`;
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading GA4 properties:', error);
+            }
+
+            // Load GSC sites
+            try {
+                const gscResponse = await fetch('/api/gsc/sites');
+                if (gscResponse.ok) {
+                    const gscData = await gscResponse.json();
+                    const select = document.getElementById('gscSiteSelect');
+                    select.innerHTML = '<option value="">-- Select GSC Site --</option>';
+                    gscData.sites.forEach(site => {
+                        select.innerHTML += `<option value="${site.url}">${site.url}</option>`;
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading GSC sites:', error);
+            }
+        }
+
+        async function logout() {
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+                isGoogleConnected = false;
+                toggleDataSource('ga4', 'csv');
+                toggleDataSource('gsc', 'csv');
+                updateGoogleUI();
+            } catch (error) {
+                console.error('Error logging out:', error);
+            }
+        }
+
+        function toggleDataSource(type, source) {
+            const toggleBtns = document.querySelectorAll(`#${type}Toggle .toggle-btn`);
+            toggleBtns.forEach(btn => {
+                btn.classList.toggle('active', btn.dataset.source === source);
+            });
+
+            const csvUpload = document.getElementById(`${type}CsvUpload`);
+            const apiInfo = document.getElementById(`${type}ApiInfo`);
+            const useApiField = document.getElementById(`use${type.charAt(0).toUpperCase() + type.slice(1)}Api`);
+
+            if (source === 'csv') {
+                csvUpload.classList.remove('hidden');
+                apiInfo.classList.add('hidden');
+                useApiField.value = 'false';
+            } else {
+                csvUpload.classList.add('hidden');
+                apiInfo.classList.remove('hidden');
+                useApiField.value = 'true';
+            }
+
+            if (type === 'ga4') ga4DataSource = source;
+            if (type === 'gsc') gscDataSource = source;
+        }
+
         // File input handlers
         function setupFileInput(inputId, btnId, nameId) {
             const input = document.getElementById(inputId);
@@ -753,6 +1302,14 @@ async def root():
         setupFileInput('gaFile', 'gaBtn', 'gaFileName');
         setupFileInput('gscFile', 'gscBtn', 'gscFileName');
         setupFileInput('backlinkFile', 'backlinkBtn', 'backlinkFileName');
+
+        // Update hidden fields when selectors change
+        document.getElementById('ga4PropertySelect').addEventListener('change', function() {
+            document.getElementById('ga4PropertyId').value = this.value;
+        });
+        document.getElementById('gscSiteSelect').addEventListener('change', function() {
+            document.getElementById('gscSiteUrl').value = this.value;
+        });
 
         // Form submission
         document.getElementById('wqaForm').addEventListener('submit', async function(e) {
@@ -799,6 +1356,22 @@ async def root():
                 submitBtn.textContent = 'Generate WQA Report';
             }
         });
+
+        // Check for connection status on URL params
+        const urlParams = new URLSearchParams(window.location.search);
+        if (urlParams.get('connected') === 'google') {
+            // Clear the URL param
+            window.history.replaceState({}, document.title, window.location.pathname);
+        }
+        if (urlParams.get('error')) {
+            const status = document.getElementById('status');
+            status.className = 'status error';
+            status.textContent = 'Google authentication failed: ' + urlParams.get('error');
+            window.history.replaceState({}, document.title, window.location.pathname);
+        }
+
+        // Initialize
+        checkAuthStatus();
     </script>
 </body>
 </html>
@@ -807,6 +1380,7 @@ async def root():
 
 @app.post("/api/generate")
 async def generate_report(
+    request: Request,
     crawl_file: UploadFile = File(...),
     ga_file: Optional[UploadFile] = File(None),
     gsc_file: Optional[UploadFile] = File(None),
@@ -814,29 +1388,47 @@ async def generate_report(
     low_traffic_threshold: int = Form(5),
     thin_content_threshold: int = Form(1000),
     high_rank_max_position: float = Form(20.0),
-    low_ctr_threshold: float = Form(0.05)
+    low_ctr_threshold: float = Form(0.05),
+    use_ga4_api: str = Form("false"),
+    ga4_property_id: str = Form(""),
+    use_gsc_api: str = Form("false"),
+    gsc_site_url: str = Form(""),
+    google_tokens: Optional[str] = Cookie(None)
 ):
-    """Generate WQA report from uploaded CSV files"""
+    """Generate WQA report from uploaded CSV files or Google API data"""
     try:
         # Read crawl file (required)
         crawl_content = await crawl_file.read()
         crawl_df = load_crawl_data(crawl_content)
         logger.info(f"Loaded crawl data: {len(crawl_df)} rows")
 
-        # Read optional files
+        # Get GA4 data - either from API or CSV
         ga_df = None
-        if ga_file and ga_file.filename:
+        if use_ga4_api == "true" and ga4_property_id and google_tokens:
+            tokens = decrypt_token(google_tokens)
+            if tokens:
+                credentials = get_credentials_from_tokens(tokens)
+                ga_df = await fetch_ga4_report(credentials, ga4_property_id)
+                logger.info(f"Loaded GA4 data from API: {len(ga_df)} rows")
+        elif ga_file and ga_file.filename:
             ga_content = await ga_file.read()
             if ga_content:
                 ga_df = load_ga_data(ga_content)
-                logger.info(f"Loaded GA4 data: {len(ga_df)} rows")
+                logger.info(f"Loaded GA4 data from CSV: {len(ga_df)} rows")
 
+        # Get GSC data - either from API or CSV
         gsc_df = None
-        if gsc_file and gsc_file.filename:
+        if use_gsc_api == "true" and gsc_site_url and google_tokens:
+            tokens = decrypt_token(google_tokens)
+            if tokens:
+                credentials = get_credentials_from_tokens(tokens)
+                gsc_df = await fetch_gsc_report(credentials, gsc_site_url)
+                logger.info(f"Loaded GSC data from API: {len(gsc_df)} rows")
+        elif gsc_file and gsc_file.filename:
             gsc_content = await gsc_file.read()
             if gsc_content:
                 gsc_df = load_gsc_data(gsc_content)
-                logger.info(f"Loaded GSC data: {len(gsc_df)} rows")
+                logger.info(f"Loaded GSC data from CSV: {len(gsc_df)} rows")
 
         backlink_df = None
         if backlink_file and backlink_file.filename:
