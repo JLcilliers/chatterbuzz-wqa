@@ -148,18 +148,28 @@ def get_credentials_from_tokens(tokens: dict) -> Credentials:
 # COLUMN MAPPING CONFIGURATION
 # =============================================================================
 
+# Crawl Data Column Mapping - supports Screaming Frog, Sitebulb, JetOctopus, OnCrawl, etc.
 CRAWL_COLUMN_MAP = {
-    'url': ['url', 'address', 'page_url', 'page'],
-    'status_code': ['status_code', 'status', 'http_status', 'response_code'],
-    'indexable': ['indexable', 'indexability', 'is_indexable', 'index_status'],
-    'canonical_url': ['canonical_url', 'canonical', 'canonical_link', 'canonical_tag'],
-    'inlinks': ['inlinks', 'internal_inlinks', 'inlinks_count', 'unique_inlinks'],
-    'outlinks': ['outlinks', 'internal_outlinks', 'outlinks_count', 'unique_outlinks'],
-    'crawl_depth': ['crawl_depth', 'depth', 'click_depth', 'level'],
-    'in_sitemap': ['in_sitemap', 'sitemap', 'in_xml_sitemap', 'sitemap_status'],
-    'page_title': ['page_title', 'title', 'title_1', 'meta_title'],
-    'meta_description': ['meta_description', 'description', 'meta_description_1'],
-    'word_count': ['word_count', 'words', 'content_word_count', 'text_word_count'],
+    'url': ['address', 'url', 'page_url', 'page', 'page url', 'full url'],
+    'status_code': ['status code', 'status_code', 'status', 'http_status', 'response_code', 'http status code'],
+    'indexable': ['indexability', 'indexable', 'is_indexable', 'index_status', 'index status'],
+    'meta_robots': ['meta robots 1', 'meta_robots', 'meta robots', 'robots', 'robots directive'],
+    'canonical_url': ['canonical link element 1', 'canonical_url', 'canonical', 'canonical_link',
+                      'canonical_tag', 'canonical url', 'canonicals'],
+    'content_type': ['content type', 'content_type', 'mime type', 'type'],
+    'inlinks': ['unique inlinks', 'inlinks', 'internal_inlinks', 'inlinks_count', 'internal inlinks',
+                'internal links in', 'links in'],
+    'outlinks': ['unique outlinks', 'outlinks', 'internal_outlinks', 'outlinks_count', 'internal outlinks',
+                 'internal links out', 'links out'],
+    'crawl_depth': ['crawl depth', 'crawl_depth', 'depth', 'click_depth', 'level', 'click depth',
+                    'page depth', 'distance'],
+    'in_sitemap': ['indexability status', 'in xml sitemap', 'in_sitemap', 'sitemap', 'in_xml_sitemap',
+                   'sitemap_status', 'xml sitemap'],
+    'page_title': ['title 1', 'page_title', 'title', 'meta_title', 'page title', 'seo title'],
+    'meta_description': ['meta description 1', 'meta_description', 'description', 'meta description'],
+    'h1': ['h1-1', 'h1', 'h1 1', 'heading 1', 'first h1'],
+    'word_count': ['word count', 'word_count', 'words', 'content_word_count', 'text_word_count',
+                   'text content', 'body word count'],
 }
 
 GA_COLUMN_MAP = {
@@ -177,12 +187,74 @@ GSC_COLUMN_MAP = {
     'primary_keyword': ['primary_keyword', 'query', 'top_query', 'keyword'],
 }
 
+# Backlink Data Column Mapping - supports Ahrefs, Semrush, Moz, Majestic, etc.
 BACKLINK_COLUMN_MAP = {
-    'url': ['url', 'target_url', 'page', 'target'],
-    'referring_domains': ['referring_domains', 'ref_domains', 'domains', 'rd'],
-    'backlinks': ['backlinks', 'backlink_count', 'external_links', 'links'],
-    'anchor_texts': ['anchor_texts', 'anchors', 'anchor_text'],
+    'url': ['url', 'target url', 'target_url', 'page', 'target', 'page url', 'target page'],
+    'referring_domains': ['referring domains', 'referring_domains', 'ref domains', 'ref_domains',
+                          'domains', 'rd', 'dofollow referring domains', 'root domains'],
+    'backlinks': ['backlinks', 'backlink_count', 'external_links', 'links', 'total backlinks',
+                  'dofollow backlinks', 'external backlinks', 'inbound links'],
+    'authority': ['ur', 'url rating', 'url_rating', 'authority score', 'authority_score',
+                  'page authority', 'page_authority', 'pa', 'trust flow', 'citation flow',
+                  'domain rating', 'dr', 'as'],
+    'anchor_texts': ['anchor_texts', 'anchors', 'anchor_text', 'anchor', 'top anchor'],
 }
+
+
+# =============================================================================
+# API PROVIDER INTERFACES (Future Extension Points)
+# =============================================================================
+# These abstract base classes define the interface for future API integrations.
+# Implement a provider by subclassing and registering with the provider registry.
+
+from abc import ABC, abstractmethod
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class CrawlProvider(Protocol):
+    """Interface for crawl data providers (JetOctopus, custom crawlers, etc.)"""
+    provider_name: str
+
+    async def fetch_crawl_data(self, site_url: str, **options) -> pd.DataFrame:
+        """Fetch crawl data for a site. Returns DataFrame with CRAWL_COLUMN_MAP fields."""
+        ...
+
+    def get_required_credentials(self) -> List[str]:
+        """Return list of required credential keys (e.g., ['api_key', 'project_id'])"""
+        ...
+
+
+@runtime_checkable
+class BacklinkProvider(Protocol):
+    """Interface for backlink data providers (Ahrefs, Semrush, Moz, etc.)"""
+    provider_name: str
+
+    async def fetch_backlink_data(self, site_url: str, **options) -> pd.DataFrame:
+        """Fetch backlink data for a site. Returns DataFrame with BACKLINK_COLUMN_MAP fields."""
+        ...
+
+    def get_required_credentials(self) -> List[str]:
+        """Return list of required credential keys (e.g., ['api_key'])"""
+        ...
+
+
+# Provider registries (populated when providers are implemented)
+CRAWL_PROVIDERS: Dict[str, type] = {}
+BACKLINK_PROVIDERS: Dict[str, type] = {}
+
+def register_crawl_provider(name: str):
+    """Decorator to register a crawl provider"""
+    def decorator(cls):
+        CRAWL_PROVIDERS[name] = cls
+        return cls
+    return decorator
+
+def register_backlink_provider(name: str):
+    """Decorator to register a backlink provider"""
+    def decorator(cls):
+        BACKLINK_PROVIDERS[name] = cls
+        return cls
+    return decorator
 
 
 # =============================================================================
@@ -313,7 +385,7 @@ def load_backlink_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
         return None
     df = pd.read_csv(io.BytesIO(file_content), low_memory=False)
     df_mapped = map_columns(df, BACKLINK_COLUMN_MAP, 'Backlinks')
-    for col in ['referring_domains', 'backlinks']:
+    for col in ['referring_domains', 'backlinks', 'authority']:
         if col in df_mapped.columns:
             df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
     return df_mapped
@@ -363,17 +435,20 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
             bl_agg_cols['referring_domains'] = 'sum'
         if 'backlinks' in backlink_df.columns:
             bl_agg_cols['backlinks'] = 'sum'
+        if 'authority' in backlink_df.columns:
+            bl_agg_cols['authority'] = 'max'  # Take highest authority score if multiple entries
         if bl_agg_cols:
             bl_agg = backlink_df.groupby('url').agg(bl_agg_cols).reset_index()
             df = df.merge(bl_agg, on='url', how='left', suffixes=('', '_bl'))
 
     expected_columns = {
         'url': '', 'status_code': 0, 'indexable': True, 'canonical_url': '',
+        'meta_robots': '', 'content_type': '', 'h1': '',
         'inlinks': 0, 'outlinks': 0, 'crawl_depth': 0, 'in_sitemap': False,
         'page_title': '', 'meta_description': '', 'word_count': 0,
         'sessions': 0, 'conversions': 0, 'avg_position': 0.0, 'ctr': 0.0,
         'clicks': 0, 'impressions': 0, 'referring_domains': 0, 'backlinks': 0,
-        'primary_keyword': '',
+        'authority': 0, 'primary_keyword': '',
     }
 
     for col, default in expected_columns.items():
@@ -965,6 +1040,11 @@ async def root():
             padding: 15px; margin-bottom: 25px; border-radius: 0 8px 8px 0;
         }
         .info-box p { color: #444; font-size: 0.9rem; line-height: 1.5; }
+        .helper-text {
+            margin-top: 10px; padding: 12px 15px; background: #f8f9fa;
+            border-radius: 6px; font-size: 0.85rem; color: #555; line-height: 1.6;
+        }
+        .helper-text strong { color: #444; }
 
         /* Google OAuth styles */
         .google-section {
@@ -1071,10 +1151,14 @@ async def root():
                 <h3><span class="required">*</span> Crawl Data (Required)</h3>
                 <div class="file-input-wrapper">
                     <div class="file-input-btn" id="crawlBtn">
-                        <div>Click or drag to upload crawl CSV</div>
+                        <div>Click or drag to upload crawl CSV (e.g., Screaming Frog / Sitebulb "All URLs" export)</div>
                         <div class="file-name" id="crawlFileName"></div>
                     </div>
                     <input type="file" name="crawl_file" id="crawlFile" accept=".csv" required>
+                </div>
+                <div class="helper-text">
+                    Upload a full-site crawl report with one row per URL. Recommended: Screaming Frog "Internal → Export → All" or Sitebulb "All URLs" table export.<br>
+                    <strong>Required columns (or equivalents):</strong> URL, Status Code, Indexability/Meta Robots, Canonical URL, Word Count, Title, Meta Description, H1, Crawl Depth, Inlinks, Sitemap status
                 </div>
             </div>
 
@@ -1124,10 +1208,15 @@ async def root():
                 <h3>Backlink Data <span class="optional">(Optional)</span></h3>
                 <div class="file-input-wrapper">
                     <div class="file-input-btn" id="backlinkBtn">
-                        <div>Click or drag to upload backlinks CSV</div>
+                        <div>Click or drag to upload backlinks CSV (e.g., Ahrefs / Semrush / Moz per-URL export)</div>
                         <div class="file-name" id="backlinkFileName"></div>
                     </div>
                     <input type="file" name="backlink_file" id="backlinkFile" accept=".csv">
+                </div>
+                <div class="helper-text">
+                    Upload per-URL backlink metrics from your link tool (Ahrefs, Semrush, Moz, Majestic).<br>
+                    Recommended: "Best by links" / "Indexed pages" export.<br>
+                    <strong>Required columns (or equivalents):</strong> URL, Referring Domains, Backlinks, Page Authority (UR/PA/AS)
                 </div>
             </div>
 
