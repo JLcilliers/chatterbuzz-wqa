@@ -1542,10 +1542,11 @@ async def generate_report(
                 high_rank_max_position=high_rank_max_position,
                 low_ctr_threshold=low_ctr_threshold
             ),
-            axis=1
+            axis=1,
+            result_type='expand'
         )
-        df['technical_actions'] = actions_result.apply(lambda x: ', '.join(x[0]) if x[0] else '')
-        df['content_actions'] = actions_result.apply(lambda x: ', '.join(x[1]) if x[1] else '')
+        df['technical_actions'] = actions_result[0].apply(lambda x: ', '.join(x) if x else '')
+        df['content_actions'] = actions_result[1].apply(lambda x: ', '.join(x) if x else '')
 
         # Assign priority
         df['priority'] = df.apply(assign_priority, axis=1)
