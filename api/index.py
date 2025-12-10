@@ -195,16 +195,27 @@ GSC_COLUMN_MAP = {
 }
 
 # Backlink Data Column Mapping - supports Ahrefs, Semrush, Moz, Majestic, etc.
+# Supports both per-URL aggregated exports AND per-backlink raw exports (like SEMRush)
 BACKLINK_COLUMN_MAP = {
+    # Target URL (the page receiving the backlink)
     'url': ['url', 'target url', 'target_url', 'page', 'target', 'page url', 'target page'],
+    # Source URL (the page providing the backlink) - used for per-backlink formats
+    'source_url': ['source url', 'source_url', 'source', 'referring url', 'referring_url',
+                   'from url', 'from_url', 'linking page'],
+    # Pre-aggregated referring domains count
     'referring_domains': ['referring domains', 'referring_domains', 'ref domains', 'ref_domains',
                           'domains', 'rd', 'dofollow referring domains', 'root domains'],
+    # Pre-aggregated backlinks count
     'backlinks': ['backlinks', 'backlink_count', 'external_links', 'links', 'total backlinks',
                   'dofollow backlinks', 'external backlinks', 'inbound links'],
+    # Authority score (source page authority for per-backlink, target page for aggregated)
     'authority': ['ur', 'url rating', 'url_rating', 'authority score', 'authority_score',
                   'page authority', 'page_authority', 'pa', 'trust flow', 'citation flow',
-                  'domain rating', 'dr', 'as'],
+                  'domain rating', 'dr', 'as', 'page ascore', 'ascore'],
+    # Anchor text
     'anchor_texts': ['anchor_texts', 'anchors', 'anchor_text', 'anchor', 'top anchor'],
+    # Nofollow indicator (for per-backlink formats)
+    'nofollow': ['nofollow', 'no_follow', 'is_nofollow', 'rel_nofollow'],
 }
 
 
@@ -413,15 +424,76 @@ def load_gsc_data(file_content: Optional[bytes], filename: str = "") -> Optional
     return df_mapped
 
 
+def extract_domain(url: str) -> str:
+    """Extract domain from URL for referring domain counting"""
+    if pd.isna(url) or not url:
+        return ''
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(str(url))
+        domain = parsed.netloc or parsed.path.split('/')[0]
+        # Remove www. prefix for consistent domain counting
+        if domain.startswith('www.'):
+            domain = domain[4:]
+        return domain.lower()
+    except:
+        return ''
+
+
 def load_backlink_data(file_content: Optional[bytes], filename: str = "") -> Optional[pd.DataFrame]:
+    """Load and process backlink data, supporting both aggregated and per-backlink formats.
+
+    Detects format automatically:
+    - If 'source_url' column exists: per-backlink format (SEMRush style) - aggregates by target URL
+    - Otherwise: pre-aggregated format (Ahrefs style) - uses data as-is
+    """
     if file_content is None:
         return None
+
     df = read_file_to_dataframe(file_content, filename)
     df_mapped = map_columns(df, BACKLINK_COLUMN_MAP, 'Backlinks')
-    for col in ['referring_domains', 'backlinks', 'authority']:
-        if col in df_mapped.columns:
-            df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
-    return df_mapped
+
+    # Check if this is a per-backlink format (has source_url column)
+    # This indicates SEMRush-style export where each row is one backlink
+    if 'source_url' in df_mapped.columns and 'url' in df_mapped.columns:
+        logger.info("Detected per-backlink format (SEMRush style) - aggregating by target URL")
+
+        # Normalize target URLs
+        df_mapped['url'] = df_mapped['url'].apply(normalize_url)
+        df_mapped = df_mapped[df_mapped['url'] != '']
+
+        # Extract source domains for referring domain counting
+        df_mapped['source_domain'] = df_mapped['source_url'].apply(extract_domain)
+
+        # Determine if link is dofollow (not nofollow)
+        if 'nofollow' in df_mapped.columns:
+            df_mapped['is_dofollow'] = ~df_mapped['nofollow'].fillna(False).astype(bool)
+        else:
+            df_mapped['is_dofollow'] = True
+
+        # Aggregate by target URL
+        aggregated = df_mapped.groupby('url').agg(
+            backlinks=('url', 'count'),  # Count total backlinks
+            referring_domains=('source_domain', 'nunique'),  # Count unique referring domains
+            dofollow_links=('is_dofollow', 'sum'),  # Count dofollow links
+            authority=('authority', 'max') if 'authority' in df_mapped.columns else ('url', lambda x: 0),  # Max authority score
+        ).reset_index()
+
+        # Ensure numeric types
+        for col in ['backlinks', 'referring_domains', 'dofollow_links', 'authority']:
+            if col in aggregated.columns:
+                aggregated[col] = pd.to_numeric(aggregated[col], errors='coerce').fillna(0).astype(int)
+
+        logger.info(f"Aggregated {len(df_mapped)} backlinks into {len(aggregated)} URLs")
+        return aggregated
+
+    else:
+        # Pre-aggregated format - use as-is
+        logger.info("Detected pre-aggregated backlink format")
+        for col in ['referring_domains', 'backlinks', 'authority']:
+            if col in df_mapped.columns:
+                df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
+        return df_mapped
 
 
 # =============================================================================
@@ -483,6 +555,8 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
             bl_agg_cols['referring_domains'] = 'sum'
         if 'backlinks' in backlink_df.columns:
             bl_agg_cols['backlinks'] = 'sum'
+        if 'dofollow_links' in backlink_df.columns:
+            bl_agg_cols['dofollow_links'] = 'sum'
         if 'authority' in backlink_df.columns:
             bl_agg_cols['authority'] = 'max'  # Take highest authority score if multiple entries
         if bl_agg_cols:
@@ -502,7 +576,7 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
         # GSC data columns
         'avg_position': 0.0, 'ctr': 0.0, 'clicks': 0, 'impressions': 0, 'primary_keyword': '',
         # Backlink data columns
-        'referring_domains': 0, 'backlinks': 0, 'authority': 0,
+        'referring_domains': 0, 'backlinks': 0, 'dofollow_links': 0, 'authority': 0,
     }
 
     for col, default in expected_columns.items():
@@ -819,7 +893,7 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
             row.get('word_count', 0),                           # 27: Word Count
             row.get('inlinks', 0),                              # 28: Inlinks
             row.get('outlinks', 0),                             # 29: Outlinks
-            row.get('backlinks', 0),                            # 30: DOFOLLOW Links
+            row.get('dofollow_links', 0),                        # 30: DOFOLLOW Links
             row.get('canonical_url', ''),                       # 31: Canonical Link Element
             row.get('status_code', ''),                         # 32: Status Code
             index_label,                                        # 33: Index / Noindex
