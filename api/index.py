@@ -177,7 +177,9 @@ CRAWL_COLUMN_MAP = {
 GA_COLUMN_MAP = {
     'url': ['url', 'page_path', 'page', 'landing_page', 'page_location'],
     'sessions': ['sessions', 'session_count', 'visits'],
-    'conversions': ['conversions', 'goal_completions', 'conversion_count', 'key_events'],
+    'sessions_prev': ['sessions_prev', 'sessions_previous', 'previous_sessions', 'sessions_yoy',
+                      'sessions_last_year', 'prior_sessions'],
+    'conversions': ['conversions', 'goal_completions', 'conversion_count', 'key_events', 'keyEvents'],
     'bounce_rate': ['bounce_rate', 'bounceRate', 'bounce rate'],
     'avg_session_duration': ['avg_session_duration', 'averageSessionDuration', 'average session duration',
                              'session_duration', 'avgSessionDuration'],
@@ -216,6 +218,29 @@ BACKLINK_COLUMN_MAP = {
     'anchor_texts': ['anchor_texts', 'anchors', 'anchor_text', 'anchor', 'top anchor'],
     # Nofollow indicator (for per-backlink formats)
     'nofollow': ['nofollow', 'no_follow', 'is_nofollow', 'rel_nofollow'],
+}
+
+# Keyword Tracking Data Column Mapping - supports SEMrush Position Tracking, Ahrefs Rank Tracker, etc.
+KEYWORD_COLUMN_MAP = {
+    # Target URL that ranks for the keyword
+    'url': ['url', 'landing page', 'landing_page', 'page', 'page url', 'ranking url', 'target url'],
+    # The keyword/query
+    'keyword': ['keyword', 'query', 'search term', 'keyphrase', 'key phrase', 'target keyword'],
+    # Search volume for the keyword
+    'volume': ['volume', 'search volume', 'search_volume', 'monthly volume', 'avg. volume',
+               'average volume', 'monthly searches'],
+    # Current ranking position
+    'position': ['position', 'rank', 'ranking', 'current position', 'current rank',
+                 'google position', 'serp position'],
+    # Previous ranking position (for tracking changes)
+    'prev_position': ['previous position', 'prev_position', 'previous rank', 'last position',
+                      'position change'],
+    # Keyword difficulty
+    'difficulty': ['difficulty', 'kd', 'keyword difficulty', 'kw difficulty', 'competition'],
+    # CPC value
+    'cpc': ['cpc', 'cost per click', 'avg cpc', 'avg. cpc'],
+    # Intent classification
+    'intent': ['intent', 'search intent', 'keyword intent'],
 }
 
 
@@ -331,27 +356,143 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def classify_page_type(url: str) -> str:
+def url_to_page_path(url: str) -> str:
+    """Extract normalized page path from a full URL for GA4 join.
+
+    Examples:
+        https://example.com/states/tennessee/ -> /states/tennessee
+        https://example.com/ -> /
+        /states/tennessee/ -> /states/tennessee
+    """
+    if pd.isna(url) or not url:
+        return '/'
+    url = str(url).strip()
+
+    try:
+        # If it's already just a path (starts with /), use it directly
+        if url.startswith('/'):
+            path = url
+        else:
+            parsed = urlparse(url)
+            path = parsed.path or '/'
+
+        # Normalize: lowercase, strip trailing slash (except for root)
+        path = path.lower()
+        if path != '/' and path.endswith('/'):
+            path = path.rstrip('/')
+
+        # Ensure it starts with /
+        if not path.startswith('/'):
+            path = '/' + path
+
+        return path if path else '/'
+    except Exception:
+        return '/'
+
+
+def normalize_page_path(path: str) -> str:
+    """Normalize a GA4 pagePath value for joining.
+
+    GA4 returns pagePath like '/states/tennessee/' - we normalize it to match url_to_page_path output.
+    """
+    if pd.isna(path) or not path:
+        return '/'
+    path = str(path).strip().lower()
+
+    # Ensure starts with /
+    if not path.startswith('/'):
+        path = '/' + path
+
+    # Strip trailing slash (except for root)
+    if path != '/' and path.endswith('/'):
+        path = path.rstrip('/')
+
+    return path if path else '/'
+
+
+def classify_page_type(url: str, page_title: str = '', content_type: str = '') -> str:
+    """
+    Classify page into expanded taxonomy:
+    - Home Page: Root/homepage
+    - Local Lander: Location/city/area pages
+    - Landing Page: Service/product/solution pages
+    - Lead Generation: Contact, quote, demo request pages
+    - Blog Post: Individual blog articles
+    - Blog Category: Blog listing/category/tag pages
+    - Resource / Guide: Resources, guides, whitepapers, case studies
+    - Site Info: About, privacy, terms, careers pages
+    - Other: Anything else
+    """
     if not url or pd.isna(url):
         return 'Other'
     url_lower = str(url).lower()
+    title_lower = str(page_title).lower() if page_title else ''
+
     try:
         parsed = urlparse(url_lower)
-        path = parsed.path
+        path = parsed.path.replace('\\', '/')
     except Exception:
-        path = url_lower
+        path = url_lower.replace('\\', '/')
 
+    # Home Page - root path only
     if path in ['/', ''] or path.rstrip('/') == '':
-        return 'Home'
-    if any(pattern in path for pattern in ['/blog/', '/blog', '/news/', '/news', '/articles/', '/posts/']):
-        return 'Blog'
-    if any(pattern in path for pattern in ['/location/', '/locations/', '/city/', '/cities/',
-                                            '/service-area/', '/service-areas/', '/area/', '/areas/',
-                                            '/near-me/', '/local/']):
+        return 'Home Page'
+
+    # Lead Generation - contact, quote, demo pages (check early - high priority)
+    lead_gen_patterns = ['/contact', '/get-quote', '/request-quote', '/free-quote',
+                         '/demo', '/request-demo', '/schedule', '/book-', '/appointment',
+                         '/consultation', '/free-estimate', '/get-started', '/signup', '/sign-up',
+                         '/register', '/inquiry', '/enquiry']
+    if any(pattern in path for pattern in lead_gen_patterns):
+        return 'Lead Generation'
+
+    # Blog Category - blog listing/category/tag pages (check before Blog Post)
+    blog_category_patterns = ['/blog/', '/blog', '/news/', '/news', '/articles/', '/posts/']
+    # Check if it's a category/tag/author page or the main blog listing
+    if any(pattern in path for pattern in blog_category_patterns):
+        # If path ends with /blog or /blog/ or has category/tag/author/page patterns
+        category_indicators = ['/category/', '/tag/', '/author/', '/page/', '/topics/']
+        if (path.rstrip('/').endswith('/blog') or
+            path.rstrip('/').endswith('/news') or
+            path.rstrip('/').endswith('/articles') or
+            any(ind in path for ind in category_indicators)):
+            return 'Blog Category'
+        # Otherwise it's likely a blog post (has additional path segments)
+        return 'Blog Post'
+
+    # Local Lander - location/city/area pages
+    local_patterns = ['/location/', '/locations/', '/city/', '/cities/',
+                      '/service-area/', '/service-areas/', '/area/', '/areas/',
+                      '/near-me', '/local/', '/region/', '/state/', '/county/']
+    if any(pattern in path for pattern in local_patterns):
         return 'Local Lander'
-    if any(pattern in path for pattern in ['/service/', '/services/', '/solutions/', '/products/',
-                                            '/what-we-do/', '/offerings/']):
-        return 'Service'
+
+    # Resource / Guide - educational content, downloads, case studies
+    resource_patterns = ['/resource/', '/resources/', '/guide/', '/guides/',
+                        '/whitepaper/', '/whitepapers/', '/ebook/', '/ebooks/',
+                        '/case-study/', '/case-studies/', '/casestudy/', '/casestudies/',
+                        '/download/', '/downloads/', '/library/', '/learn/',
+                        '/how-to/', '/tutorial/', '/tutorials/', '/faq/', '/faqs/',
+                        '/knowledge-base/', '/kb/', '/help-center/', '/documentation/']
+    if any(pattern in path for pattern in resource_patterns):
+        return 'Resource / Guide'
+
+    # Site Info - corporate/legal/info pages
+    site_info_patterns = ['/about', '/privacy', '/terms', '/legal/', '/disclaimer',
+                          '/careers/', '/jobs/', '/team/', '/leadership/',
+                          '/cookie', '/gdpr', '/accessibility', '/sitemap',
+                          '/press/', '/media/', '/awards/', '/testimonials/',
+                          '/partners/', '/affiliate/', '/referral/']
+    if any(pattern in path for pattern in site_info_patterns):
+        return 'Site Info'
+
+    # Landing Page - service/product/solution pages
+    landing_patterns = ['/service/', '/services/', '/solutions/', '/solution/',
+                       '/products/', '/product/', '/what-we-do/', '/offerings/',
+                       '/industries/', '/industry/', '/capabilities/', '/expertise/']
+    if any(pattern in path for pattern in landing_patterns):
+        return 'Landing Page'
+
     return 'Other'
 
 
@@ -406,7 +547,7 @@ def load_ga_data(file_content: Optional[bytes], filename: str = "") -> Optional[
     df = read_file_to_dataframe(file_content, filename)
     df_mapped = map_columns(df, GA_COLUMN_MAP, 'GA4')
     # Convert numeric columns
-    numeric_cols = ['sessions', 'conversions', 'bounce_rate', 'avg_session_duration', 'ecom_revenue']
+    numeric_cols = ['sessions', 'sessions_prev', 'conversions', 'bounce_rate', 'avg_session_duration', 'ecom_revenue']
     for col in numeric_cols:
         if col in df_mapped.columns:
             df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
@@ -422,6 +563,76 @@ def load_gsc_data(file_content: Optional[bytes], filename: str = "") -> Optional
         if col in df_mapped.columns:
             df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
     return df_mapped
+
+
+def load_keyword_data(file_content: Optional[bytes], filename: str = "") -> Optional[pd.DataFrame]:
+    """Load keyword tracking data and aggregate by URL to get best keyword per page.
+
+    Returns DataFrame with columns: url, main_kw, main_kw_volume, main_kw_ranking, best_kw, best_kw_ranking
+    - main_kw: Keyword with highest search volume for the URL
+    - best_kw: Keyword with best (lowest) ranking position for the URL
+    """
+    if file_content is None:
+        return None
+
+    df = read_file_to_dataframe(file_content, filename)
+    df_mapped = map_columns(df, KEYWORD_COLUMN_MAP, 'Keywords')
+
+    # Check required columns
+    if 'url' not in df_mapped.columns or 'keyword' not in df_mapped.columns:
+        logger.warning("Keyword data missing required columns (url, keyword)")
+        return None
+
+    # Normalize URLs
+    df_mapped['url'] = df_mapped['url'].apply(normalize_url)
+    df_mapped = df_mapped[df_mapped['url'] != '']
+
+    # Convert numeric columns
+    for col in ['volume', 'position', 'difficulty', 'cpc']:
+        if col in df_mapped.columns:
+            df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
+
+    # Ensure position is valid (greater than 0)
+    if 'position' in df_mapped.columns:
+        df_mapped.loc[df_mapped['position'] <= 0, 'position'] = 999
+
+    result_rows = []
+
+    for url, group in df_mapped.groupby('url'):
+        row_data = {'url': url}
+
+        # Main KW: keyword with highest volume
+        if 'volume' in group.columns:
+            main_kw_row = group.loc[group['volume'].idxmax()]
+            row_data['main_kw'] = main_kw_row.get('keyword', '')
+            row_data['main_kw_volume'] = main_kw_row.get('volume', 0)
+            row_data['main_kw_ranking'] = main_kw_row.get('position', 0) if main_kw_row.get('position', 0) < 999 else 0
+        else:
+            # If no volume, use first keyword
+            first_row = group.iloc[0]
+            row_data['main_kw'] = first_row.get('keyword', '')
+            row_data['main_kw_volume'] = 0
+            row_data['main_kw_ranking'] = first_row.get('position', 0) if first_row.get('position', 0) < 999 else 0
+
+        # Best KW: keyword with best (lowest) ranking position
+        if 'position' in group.columns:
+            valid_positions = group[group['position'] < 999]
+            if not valid_positions.empty:
+                best_kw_row = valid_positions.loc[valid_positions['position'].idxmin()]
+                row_data['best_kw'] = best_kw_row.get('keyword', '')
+                row_data['best_kw_ranking'] = best_kw_row.get('position', 0)
+            else:
+                row_data['best_kw'] = ''
+                row_data['best_kw_ranking'] = 0
+        else:
+            row_data['best_kw'] = ''
+            row_data['best_kw_ranking'] = 0
+
+        result_rows.append(row_data)
+
+    result_df = pd.DataFrame(result_rows)
+    logger.info(f"Loaded keyword data: {len(df_mapped)} keywords across {len(result_df)} URLs")
+    return result_df
 
 
 def extract_domain(url: str) -> str:
@@ -505,7 +716,36 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
     df['url'] = df['url'].apply(normalize_url)
     df = df[df['url'] != '']
 
-    if ga_df is not None and 'url' in ga_df.columns:
+    # Create page_path column for GA4 joining
+    df['page_path'] = df['url'].apply(url_to_page_path)
+
+    # GA4 data joins on page_path (not full URL)
+    if ga_df is not None and 'page_path' in ga_df.columns:
+        ga_df = ga_df.copy()
+        # Normalize page_path in GA data (should already be normalized from fetch)
+        ga_df['page_path'] = ga_df['page_path'].apply(normalize_page_path)
+
+        # Build aggregation dict dynamically based on available columns
+        ga_agg_cols = {}
+        if 'sessions' in ga_df.columns:
+            ga_agg_cols['sessions'] = 'sum'
+        if 'conversions' in ga_df.columns:
+            ga_agg_cols['conversions'] = 'sum'
+        if 'bounce_rate' in ga_df.columns:
+            ga_agg_cols['bounce_rate'] = 'mean'
+        if 'avg_session_duration' in ga_df.columns:
+            ga_agg_cols['avg_session_duration'] = 'mean'
+        if 'ecom_revenue' in ga_df.columns:
+            ga_agg_cols['ecom_revenue'] = 'sum'
+        if 'sessions_prev' in ga_df.columns:
+            ga_agg_cols['sessions_prev'] = 'sum'
+        if ga_agg_cols:
+            ga_agg = ga_df.groupby('page_path').agg(ga_agg_cols).reset_index()
+            df = df.merge(ga_agg, on='page_path', how='left', suffixes=('', '_ga'))
+            logger.info(f"Merged GA4 data: {len(ga_agg)} paths, {df['sessions'].notna().sum()} matches")
+
+    # Also support old-style GA data with 'url' column (from CSV uploads)
+    elif ga_df is not None and 'url' in ga_df.columns:
         ga_df = ga_df.copy()
         ga_df['url'] = ga_df['url'].apply(normalize_url)
         ga_df = ga_df[ga_df['url'] != '']
@@ -597,6 +837,12 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
 
 def assign_actions(row, low_traffic_threshold=5, thin_content_threshold=1000,
                    high_rank_max_position=20.0, low_ctr_threshold=0.05) -> Tuple[List[str], List[str]]:
+    """
+    Assign Technical Actions and Content Actions to a URL.
+
+    Technical Actions: Infrastructure/SEO technical changes (redirects, schema, sitemaps, internal links)
+    Content Actions: Content quality changes (rewrite, refresh, update metadata) - NOT redirects
+    """
     technical_actions = []
     content_actions = []
 
@@ -619,86 +865,181 @@ def assign_actions(row, low_traffic_threshold=5, thin_content_threshold=1000,
     backlinks = int(row.get('backlinks', 0))
     page_type = str(row.get('page_type', 'Other'))
 
-    # Technical actions
+    # Track if page should be removed/redirected (affects content action assignment)
+    marked_for_removal = False
+
+    # =========================================================================
+    # TECHNICAL ACTIONS - Infrastructure/SEO technical changes
+    # =========================================================================
+
+    # Status code fixes (redirects are TECHNICAL, not content)
     if status_code == 302:
-        technical_actions.append('301 Redirect')
+        technical_actions.append('Convert to 301')
+
     if status_code == 404:
         if backlinks > 0 or referring_domains > 0:
-            technical_actions.append('301 Redirect')
-        elif backlinks == 0 and inlinks > 0:
+            technical_actions.append('301 Redirect (has backlinks)')
+            marked_for_removal = True
+        elif inlinks > 0:
             technical_actions.append('Remove Internal Links')
+            marked_for_removal = True
+        else:
+            marked_for_removal = True
+
     if status_code in [301, 308]:
-        technical_actions.append('Review Redirect')
+        technical_actions.append('Review Redirect Chain')
+        marked_for_removal = True
+
+    # Low-value pages that should be redirected (TECHNICAL decision)
+    if (status_code == 200 and sessions <= low_traffic_threshold and conversions == 0):
+        if backlinks > 0 or referring_domains > 0:
+            # Has link equity - redirect to preserve it
+            technical_actions.append('301 Redirect (low value, has links)')
+            marked_for_removal = True
+        elif sessions == 0 and impressions == 0 and word_count < 300:
+            # Zero-value thin content - delete
+            technical_actions.append('Delete (404)')
+            marked_for_removal = True
+
+    # Sitemap management
     if not indexable and in_sitemap:
         technical_actions.append('Remove from Sitemap')
     if indexable and status_code == 200 and sessions > 0 and not in_sitemap:
         technical_actions.append('Add to Sitemap')
+
+    # Canonicalization
     if canonical_url and canonical_url.lower() != url:
-        technical_actions.append('Canonicalize')
-    if sessions > 0 and inlinks == 0:
-        technical_actions.append('Add Internal Links')
-    if crawl_depth >= 4 and page_type in ['Home', 'Service', 'Local Lander']:
-        if 'Add Internal Links' not in technical_actions:
+        technical_actions.append('Review Canonical')
+
+    # Internal linking
+    if status_code == 200 and not marked_for_removal:
+        if sessions > 0 and inlinks == 0:
             technical_actions.append('Add Internal Links')
+        important_pages = ['Home Page', 'Landing Page', 'Local Lander', 'Lead Generation']
+        if crawl_depth >= 4 and page_type in important_pages:
+            if 'Add Internal Links' not in technical_actions:
+                technical_actions.append('Improve Page Depth')
 
-    if page_type == 'Blog':
-        technical_actions.append('Add Schema: Article')
-    elif page_type == 'Local Lander':
-        technical_actions.append('Add Schema: LocalBusiness')
-    elif page_type == 'Home':
-        technical_actions.append('Add Schema: Organization')
+    # Schema markup recommendations
+    if status_code == 200 and not marked_for_removal:
+        if page_type in ['Blog Post']:
+            technical_actions.append('Add Schema: Article')
+        elif page_type == 'Local Lander':
+            technical_actions.append('Add Schema: LocalBusiness')
+        elif page_type == 'Home Page':
+            technical_actions.append('Add Schema: Organization')
+        elif page_type == 'Resource / Guide':
+            technical_actions.append('Add Schema: HowTo/FAQ')
+        elif page_type == 'Lead Generation':
+            technical_actions.append('Add Schema: ContactPage')
 
-    # Content actions
-    if (sessions <= low_traffic_threshold and conversions == 0 and
-        backlinks == 0 and referring_domains == 0 and status_code == 200):
-        content_actions.append('Delete (404)')
-    elif (sessions <= low_traffic_threshold and conversions == 0 and
-          (backlinks > 0 or referring_domains > 0) and status_code == 200):
-        content_actions.append('301 Redirect')
+    # =========================================================================
+    # CONTENT ACTIONS - Content quality improvements (only for live pages)
+    # =========================================================================
 
-    if (word_count < thin_content_threshold and (sessions > 0 or avg_position > 0) and
-        status_code == 200 and 'Delete (404)' not in content_actions and
-        '301 Redirect' not in content_actions):
-        content_actions.append('Rewrite')
+    if status_code == 200 and not marked_for_removal:
+        # Thin content needs rewrite
+        if (word_count < thin_content_threshold and
+            (sessions > 0 or avg_position > 0 or impressions > 0)):
+            content_actions.append('Rewrite (Thin Content)')
 
-    if (word_count >= thin_content_threshold and sessions > 0 and
-        2 < avg_position <= high_rank_max_position and status_code == 200 and
-        'Delete (404)' not in content_actions and '301 Redirect' not in content_actions):
-        content_actions.append('Refresh')
+        # Ranking content that could be improved
+        elif word_count >= thin_content_threshold:
+            # Content refresh for pages ranking but could do better
+            if (sessions > 0 and 2 < avg_position <= high_rank_max_position):
+                content_actions.append('Refresh')
 
-    if (word_count >= thin_content_threshold and sessions > 0 and
-        3 <= avg_position <= 20 and referring_domains == 0 and status_code == 200 and
-        'Delete (404)' not in content_actions and '301 Redirect' not in content_actions):
-        content_actions.append('Target w/ Links')
+            # Link building target for pages with no backlinks
+            if (sessions > 0 and 3 <= avg_position <= 20 and
+                referring_domains == 0 and backlinks == 0):
+                content_actions.append('Target w/ Links')
 
-    if status_code == 200:
-        if (not meta_description or
-            (avg_position <= high_rank_max_position and ctr < low_ctr_threshold and impressions > 100)):
-            content_actions.append('Update Meta Description')
-        if (not page_title or
-            (avg_position <= high_rank_max_position and ctr < low_ctr_threshold and impressions > 100)):
-            content_actions.append('Update Page Title')
+        # Metadata improvements
+        if not meta_description:
+            content_actions.append('Add Meta Description')
+        elif (avg_position > 0 and avg_position <= high_rank_max_position and
+              ctr < low_ctr_threshold and impressions > 100):
+            content_actions.append('Improve Meta Description')
 
-    if not content_actions:
+        if not page_title:
+            content_actions.append('Add Page Title')
+        elif (avg_position > 0 and avg_position <= high_rank_max_position and
+              ctr < low_ctr_threshold and impressions > 100):
+            content_actions.append('Improve Page Title')
+
+    # Default if no content actions needed
+    if not content_actions and status_code == 200 and not marked_for_removal:
         content_actions.append('Leave As Is')
 
     return technical_actions, content_actions
 
 
 def assign_priority(row) -> str:
+    """Assign priority based on page importance and required actions."""
     status_code = int(row.get('status_code', 0))
     page_type = str(row.get('page_type', 'Other'))
+    technical_actions = str(row.get('technical_actions', ''))
     content_actions = str(row.get('content_actions', ''))
 
-    if status_code in [404, 302]:
+    # High-priority page types
+    important_pages = ['Home Page', 'Landing Page', 'Local Lander', 'Lead Generation']
+
+    # Error status codes are always high priority
+    if status_code in [404, 302, 500, 502, 503]:
         return 'High'
-    if page_type in ['Home', 'Service', 'Local Lander']:
+
+    # Important pages needing content work are high priority
+    if page_type in important_pages:
         if 'Rewrite' in content_actions or 'Refresh' in content_actions:
             return 'High'
-    if 'Delete (404)' in content_actions or '301 Redirect' in content_actions:
-        if page_type not in ['Home', 'Service', 'Local Lander']:
-            return 'Medium'
+        if '301 Redirect' in technical_actions or 'Delete' in technical_actions:
+            return 'High'  # Something's wrong with an important page
+
+    # Redirect/delete decisions for less important pages
+    if '301 Redirect' in technical_actions or 'Delete' in technical_actions:
+        return 'Medium'
+
+    # Any pages needing content work
+    if 'Rewrite' in content_actions or 'Refresh' in content_actions:
+        return 'Medium'
+
     return 'Low'
+
+
+def determine_final_url(row) -> str:
+    """
+    Determine Final URL for pages that need redirecting/merging.
+
+    Returns:
+    - Empty string for pages that don't need redirecting
+    - '[MANUAL ENTRY NEEDED]' for pages marked for 301 redirect (user must specify target)
+    - The canonical URL if page is canonicalized to a different URL
+    """
+    technical_actions = str(row.get('technical_actions', ''))
+    canonical = str(row.get('canonical_url', '')).strip()
+    url = str(row.get('url', '')).strip().lower()
+    status_code = int(row.get('status_code', 200))
+
+    # If page is already a redirect, the target URL should be looked up
+    if status_code in [301, 302, 307, 308]:
+        return '[MANUAL ENTRY NEEDED]'
+
+    # If page is marked for 301 redirect (any reason), user needs to specify target
+    if '301 Redirect' in technical_actions:
+        # If it's canonicalized to another URL, suggest that as the target
+        if canonical and canonical.lower() != url:
+            return canonical
+        return '[MANUAL ENTRY NEEDED]'
+
+    # If page is marked for deletion, no final URL needed
+    if 'Delete' in technical_actions:
+        return ''
+
+    # If page is canonicalized but not marked for redirect, show the canonical
+    if canonical and canonical.lower() != url:
+        return canonical
+
+    return ''
 
 
 def generate_summary(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -765,31 +1106,49 @@ def extract_page_path(url: str) -> str:
 
 
 def format_indexability(row) -> Tuple[str, str]:
-    """Return (Index/Noindex label, Indexation Status explanation)"""
+    """
+    Return (Index/Noindex label, Indexation Status explanation).
+
+    Index/Noindex: Simple binary status
+    Indexation Status: WHY the page is not indexable (reason), not just repeating the label
+    """
     indexable = row.get('indexable', True)
     meta_robots = str(row.get('meta_robots', '')).lower()
     status_code = int(row.get('status_code', 200))
     canonical = str(row.get('canonical_url', '')).strip()
     url = str(row.get('url', '')).strip().lower()
 
-    # Determine index/noindex
-    if status_code >= 400:
+    # Determine index/noindex label and specific reason
+    if status_code >= 500:
         index_label = 'Non-Indexable'
-        status_label = f'{status_code} Error'
+        status_reason = 'Server Error'
+    elif status_code == 404:
+        index_label = 'Non-Indexable'
+        status_reason = 'Not Found (404)'
+    elif status_code in [301, 302, 307, 308]:
+        index_label = 'Non-Indexable'
+        status_reason = 'Redirected'
+    elif status_code >= 400:
+        index_label = 'Non-Indexable'
+        status_reason = 'Client Error'
     elif 'noindex' in meta_robots:
         index_label = 'Non-Indexable'
-        status_label = 'Noindex'
+        status_reason = 'Noindex Tag'
+    elif 'nofollow' in meta_robots and 'noindex' not in meta_robots:
+        # Nofollow but not noindex - still indexable
+        index_label = 'Indexable'
+        status_reason = 'Indexable (nofollow)'
+    elif canonical and canonical.lower() != url:
+        index_label = 'Non-Indexable'
+        status_reason = 'Canonicalised'
     elif not indexable:
         index_label = 'Non-Indexable'
-        if canonical and canonical.lower() != url:
-            status_label = 'Canonicalised'
-        else:
-            status_label = 'Non-Indexable'
+        status_reason = 'Blocked'  # Generic blocked reason
     else:
         index_label = 'Indexable'
-        status_label = 'Indexable'
+        status_reason = 'OK'  # Clear signal that page is fine
 
-    return index_label, status_label
+    return index_label, status_reason
 
 
 def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) -> bytes:
@@ -861,6 +1220,18 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
         # Format in_sitemap
         in_sitemap = 'Yes' if row.get('in_sitemap', False) else 'No'
 
+        # Get best keyword data - prefer keyword file data, fall back to GSC
+        best_kw = row.get('best_kw', '')
+        best_kw_volume = row.get('best_kw_volume', '')
+        best_kw_ranking = row.get('best_kw_ranking', '')
+
+        # Fall back to GSC data if no keyword file data
+        if not best_kw:
+            best_kw = row.get('primary_keyword', '')
+            # Only show GSC ranking if we have a keyword from GSC
+            best_kw_ranking = row.get('avg_position', '') if best_kw else ''
+            best_kw_volume = ''  # GSC doesn't provide volume
+
         # Build row data matching column order
         data_row = [
             page_path,                                          # 0: page-path
@@ -872,9 +1243,9 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
             row.get('main_kw', ''),                             # 6: Main KW
             row.get('main_kw_volume', ''),                      # 7: Volume (Main KW)
             row.get('main_kw_ranking', ''),                     # 8: Ranking (Main KW)
-            row.get('primary_keyword', ''),                     # 9: "Best" KW (from GSC)
-            row.get('best_kw_volume', ''),                      # 10: Volume (Best KW)
-            row.get('avg_position', ''),                        # 11: Ranking (Best KW) - using GSC position
+            best_kw,                                            # 9: "Best" KW
+            best_kw_volume,                                     # 10: Volume (Best KW)
+            best_kw_ranking,                                    # 11: Ranking (Best KW)
             row.get('impressions', 0),                          # 12: Impressions
             sessions if sessions > 0 else '',                   # 13: Sessions
             pct_change,                                         # 14: % Change Sessions
@@ -931,6 +1302,7 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
 
         # Apply some basic formatting
         from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.styles.numbers import FORMAT_PERCENTAGE_00, FORMAT_NUMBER_COMMA_SEPARATED1
 
         # Header row styling
         header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
@@ -955,6 +1327,66 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
 
         # Freeze panes at row 4 (after headers)
         worksheet.freeze_panes = 'A4'
+
+        # Define column indices for formatting (0-based)
+        # Percentage columns: % Change Sessions (14), Bounce rate (16), Conversion Rate (19), Ecom Conv Rate (21), SERP CTR (24)
+        percentage_cols = [14, 16, 19, 21, 24]
+        # Time duration column: Average session duration (17)
+        duration_cols = [17]
+        # Date column: Last Modified (37)
+        date_cols = [37]
+        # Currency column: Ecom Revenue (20)
+        currency_cols = [20]
+        # Number columns: Impressions (12), Sessions (13), Conversions (18), Word Count (27), Inlinks (28), Outlinks (29), DOFOLLOW (30)
+        number_cols = [12, 13, 18, 27, 28, 29, 30]
+
+        # Apply number formatting to data rows
+        for row_idx in range(len(data_rows)):
+            excel_row = row_idx + 4  # Data starts at row 4
+
+            # Format percentage columns
+            for col_idx in percentage_cols:
+                cell = worksheet.cell(row=excel_row, column=col_idx + 1)
+                if cell.value is not None and cell.value != '':
+                    try:
+                        val = float(cell.value)
+                        # If value is already decimal (0-1 range), use as-is
+                        # If value is whole number (like 50 for 50%), convert
+                        if val > 1:
+                            cell.value = val / 100
+                        cell.number_format = FORMAT_PERCENTAGE_00
+                    except (ValueError, TypeError):
+                        pass
+
+            # Format duration columns (seconds to mm:ss)
+            for col_idx in duration_cols:
+                cell = worksheet.cell(row=excel_row, column=col_idx + 1)
+                if cell.value is not None and cell.value != '':
+                    try:
+                        seconds = float(cell.value)
+                        # Convert seconds to time format (fraction of day)
+                        cell.value = seconds / 86400  # Convert to Excel time
+                        cell.number_format = '[mm]:ss'
+                    except (ValueError, TypeError):
+                        pass
+
+            # Format currency columns
+            for col_idx in currency_cols:
+                cell = worksheet.cell(row=excel_row, column=col_idx + 1)
+                if cell.value is not None and cell.value != '':
+                    try:
+                        cell.number_format = '$#,##0.00'
+                    except (ValueError, TypeError):
+                        pass
+
+            # Format number columns with comma separators
+            for col_idx in number_cols:
+                cell = worksheet.cell(row=excel_row, column=col_idx + 1)
+                if cell.value is not None and cell.value != '':
+                    try:
+                        cell.number_format = '#,##0'
+                    except (ValueError, TypeError):
+                        pass
 
         # Auto-adjust column widths (basic)
         for col_idx, col_name in enumerate(column_names):
@@ -1018,15 +1450,27 @@ async def fetch_ga4_properties(credentials: Credentials) -> List[dict]:
         logger.error(f"Error fetching GA4 properties: {e}")
         return []
 
-async def fetch_ga4_report(credentials: Credentials, property_id: str, days: int = 30) -> pd.DataFrame:
-    """Fetch GA4 page data and return as DataFrame matching CSV format"""
+async def fetch_ga4_report(credentials: Credentials, property_id: str, days: int = 90) -> pd.DataFrame:
+    """Fetch GA4 page data with current and previous period for YoY comparison.
+
+    Returns DataFrame with columns:
+    - page_path: normalized path for joining with crawl data
+    - sessions, conversions, bounce_rate, avg_session_duration, ecom_revenue: current period
+    - sessions_prev: previous period sessions for YoY comparison
+    """
     try:
         service = build('analyticsdata', 'v1beta', credentials=credentials)
 
+        # Current period: last N days
         end_date = datetime.now()
         start_date = end_date - timedelta(days=days)
 
-        request_body = {
+        # Previous period: same duration, one year ago
+        prev_end_date = end_date - timedelta(days=365)
+        prev_start_date = prev_end_date - timedelta(days=days)
+
+        # === CURRENT PERIOD QUERY ===
+        current_request = {
             'dateRanges': [{
                 'startDate': start_date.strftime('%Y-%m-%d'),
                 'endDate': end_date.strftime('%Y-%m-%d')
@@ -1034,32 +1478,110 @@ async def fetch_ga4_report(credentials: Credentials, property_id: str, days: int
             'dimensions': [{'name': 'pagePath'}],
             'metrics': [
                 {'name': 'sessions'},
-                {'name': 'keyEvents'}  # This is GA4's conversion metric
+                {'name': 'keyEvents'},  # GA4's conversion metric
+                {'name': 'bounceRate'},
+                {'name': 'averageSessionDuration'},
+                {'name': 'purchaseRevenue'}  # E-commerce revenue
             ],
             'limit': 25000
         }
 
-        response = service.properties().runReport(
+        current_response = service.properties().runReport(
             property=f'properties/{property_id}',
-            body=request_body
+            body=current_request
         ).execute()
 
-        rows = []
-        for row in response.get('rows', []):
-            page_path = row['dimensionValues'][0]['value'] if row.get('dimensionValues') else ''
-            sessions = int(row['metricValues'][0]['value']) if row.get('metricValues') else 0
-            conversions = int(row['metricValues'][1]['value']) if len(row.get('metricValues', [])) > 1 else 0
+        # Build current period data map: page_path -> metrics
+        current_data = {}
+        for row in current_response.get('rows', []):
+            raw_path = row['dimensionValues'][0]['value'] if row.get('dimensionValues') else '/'
+            page_path = normalize_page_path(raw_path)
+            metrics = row.get('metricValues', [])
 
+            sessions = int(float(metrics[0]['value'])) if len(metrics) > 0 else 0
+            conversions = int(float(metrics[1]['value'])) if len(metrics) > 1 else 0
+            bounce_rate = float(metrics[2]['value']) if len(metrics) > 2 else 0.0
+            avg_duration = float(metrics[3]['value']) if len(metrics) > 3 else 0.0
+            revenue = float(metrics[4]['value']) if len(metrics) > 4 else 0.0
+
+            # Aggregate if same path appears multiple times
+            if page_path in current_data:
+                current_data[page_path]['sessions'] += sessions
+                current_data[page_path]['conversions'] += conversions
+                current_data[page_path]['ecom_revenue'] += revenue
+                # For rates, we'd need weighted average - keep simple for now
+            else:
+                current_data[page_path] = {
+                    'sessions': sessions,
+                    'conversions': conversions,
+                    'bounce_rate': bounce_rate,
+                    'avg_session_duration': avg_duration,
+                    'ecom_revenue': revenue
+                }
+
+        logger.info(f"GA4 current period: {len(current_data)} unique page paths")
+
+        # === PREVIOUS PERIOD QUERY (for YoY comparison) ===
+        prev_request = {
+            'dateRanges': [{
+                'startDate': prev_start_date.strftime('%Y-%m-%d'),
+                'endDate': prev_end_date.strftime('%Y-%m-%d')
+            }],
+            'dimensions': [{'name': 'pagePath'}],
+            'metrics': [{'name': 'sessions'}],
+            'limit': 25000
+        }
+
+        prev_data = {}
+        try:
+            prev_response = service.properties().runReport(
+                property=f'properties/{property_id}',
+                body=prev_request
+            ).execute()
+
+            for row in prev_response.get('rows', []):
+                raw_path = row['dimensionValues'][0]['value'] if row.get('dimensionValues') else '/'
+                page_path = normalize_page_path(raw_path)
+                metrics = row.get('metricValues', [])
+                sessions_prev = int(float(metrics[0]['value'])) if len(metrics) > 0 else 0
+
+                if page_path in prev_data:
+                    prev_data[page_path] += sessions_prev
+                else:
+                    prev_data[page_path] = sessions_prev
+
+            logger.info(f"GA4 previous period: {len(prev_data)} unique page paths")
+        except Exception as prev_e:
+            logger.warning(f"Could not fetch previous period GA4 data: {prev_e}")
+
+        # === COMBINE INTO DATAFRAME ===
+        rows = []
+        all_paths = set(current_data.keys()) | set(prev_data.keys())
+
+        for page_path in all_paths:
+            current = current_data.get(page_path, {})
             rows.append({
-                'url': page_path,
-                'sessions': sessions,
-                'conversions': conversions
+                'page_path': page_path,
+                'sessions': current.get('sessions', 0),
+                'conversions': current.get('conversions', 0),
+                'bounce_rate': current.get('bounce_rate', 0.0),
+                'avg_session_duration': current.get('avg_session_duration', 0.0),
+                'ecom_revenue': current.get('ecom_revenue', 0.0),
+                'sessions_prev': prev_data.get(page_path, 0)
             })
 
-        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=['url', 'sessions', 'conversions'])
+        result_df = pd.DataFrame(rows) if rows else pd.DataFrame(
+            columns=['page_path', 'sessions', 'conversions', 'bounce_rate', 'avg_session_duration', 'ecom_revenue', 'sessions_prev']
+        )
+
+        logger.info(f"GA4 combined result: {len(result_df)} rows")
+        return result_df
+
     except Exception as e:
         logger.error(f"Error fetching GA4 report: {e}")
-        return pd.DataFrame(columns=['url', 'sessions', 'conversions'])
+        return pd.DataFrame(
+            columns=['page_path', 'sessions', 'conversions', 'bounce_rate', 'avg_session_duration', 'ecom_revenue', 'sessions_prev']
+        )
 
 async def fetch_gsc_sites(credentials: Credentials) -> List[dict]:
     """Fetch list of verified GSC sites"""
@@ -1553,6 +2075,23 @@ async def root():
             </div>
 
             <div class="form-section">
+                <h3>Keyword Tracking Data <span class="optional">(Optional)</span></h3>
+                <div class="file-input-wrapper">
+                    <div class="file-input-btn" id="keywordBtn">
+                        <div>Click or drag to upload keyword tracking file (CSV or Excel)</div>
+                        <div class="file-name" id="keywordFileName"></div>
+                    </div>
+                    <input type="file" name="keyword_file" id="keywordFile" accept=".csv,.xlsx,.xls">
+                </div>
+                <div class="helper-text">
+                    Upload keyword rankings data from your rank tracker (Semrush, Ahrefs, AccuRanker, etc.).<br>
+                    This populates Main KW, Best KW, and Volume columns.<br>
+                    <strong>Required columns:</strong> URL/Landing Page, Keyword<br>
+                    <strong>Optional columns:</strong> Volume, Position/Rank, Difficulty, CPC
+                </div>
+            </div>
+
+            <div class="form-section">
                 <h3>Thresholds</h3>
                 <div class="threshold-grid">
                     <div class="threshold-item">
@@ -1723,6 +2262,7 @@ async def root():
         setupFileInput('gaFile', 'gaBtn', 'gaFileName');
         setupFileInput('gscFile', 'gscBtn', 'gscFileName');
         setupFileInput('backlinkFile', 'backlinkBtn', 'backlinkFileName');
+        setupFileInput('keywordFile', 'keywordBtn', 'keywordFileName');
 
         // Update hidden fields when selectors change
         document.getElementById('ga4PropertySelect').addEventListener('change', function() {
@@ -1806,6 +2346,7 @@ async def generate_report(
     ga_file: Optional[UploadFile] = File(None),
     gsc_file: Optional[UploadFile] = File(None),
     backlink_file: Optional[UploadFile] = File(None),
+    keyword_file: Optional[UploadFile] = File(None),
     low_traffic_threshold: int = Form(5),
     thin_content_threshold: int = Form(1000),
     high_rank_max_position: float = Form(20.0),
@@ -1858,8 +2399,22 @@ async def generate_report(
                 backlink_df = load_backlink_data(backlink_content, backlink_file.filename or "")
                 logger.info(f"Loaded backlink data: {len(backlink_df)} rows")
 
+        # Load keyword tracking data
+        keyword_df = None
+        if keyword_file and keyword_file.filename:
+            keyword_content = await keyword_file.read()
+            if keyword_content:
+                keyword_df = load_keyword_data(keyword_content, keyword_file.filename or "")
+                if keyword_df is not None:
+                    logger.info(f"Loaded keyword data: {len(keyword_df)} rows")
+
         # Merge datasets
         df = merge_datasets(crawl_df, ga_df, gsc_df, backlink_df)
+
+        # Merge keyword data if available
+        if keyword_df is not None and not keyword_df.empty:
+            df = df.merge(keyword_df, on='url', how='left')
+            logger.info(f"Merged keyword data into main DataFrame")
         logger.info(f"Merged data: {len(df)} rows")
 
         # Classify page types
@@ -1882,6 +2437,9 @@ async def generate_report(
 
         # Assign priority
         df['priority'] = df.apply(assign_priority, axis=1)
+
+        # Determine Final URL for redirects/merges
+        df['final_url'] = df.apply(determine_final_url, axis=1)
 
         # Generate summary
         summaries = generate_summary(df)
