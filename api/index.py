@@ -1409,10 +1409,10 @@ async def root():
                 <h3><span class="required">*</span> Crawl Data (Required)</h3>
                 <div class="file-input-wrapper">
                     <div class="file-input-btn" id="crawlBtn">
-                        <div>Click or drag to upload crawl CSV (e.g., Screaming Frog / Sitebulb "All URLs" export)</div>
+                        <div>Click or drag to upload crawl file (CSV or Excel)</div>
                         <div class="file-name" id="crawlFileName"></div>
                     </div>
-                    <input type="file" name="crawl_file" id="crawlFile" accept=".csv" required>
+                    <input type="file" name="crawl_file" id="crawlFile" accept=".csv,.xlsx,.xls" required>
                 </div>
                 <div class="helper-text">
                     Upload a full-site crawl report with one row per URL. Recommended: Screaming Frog "Internal → Export → All" or Sitebulb "All URLs" table export.<br>
@@ -1430,10 +1430,10 @@ async def root():
                 <div id="ga4CsvUpload">
                     <div class="file-input-wrapper">
                         <div class="file-input-btn" id="gaBtn">
-                            <div>Click or drag to upload GA4 CSV</div>
+                            <div>Click or drag to upload GA4 file (CSV or Excel)</div>
                             <div class="file-name" id="gaFileName"></div>
                         </div>
-                        <input type="file" name="ga_file" id="gaFile" accept=".csv">
+                        <input type="file" name="ga_file" id="gaFile" accept=".csv,.xlsx,.xls">
                     </div>
                 </div>
                 <div id="ga4ApiInfo" class="hidden" style="padding: 15px; background: #e8f8f0; border-radius: 8px; color: #155724;">
@@ -1451,10 +1451,10 @@ async def root():
                 <div id="gscCsvUpload">
                     <div class="file-input-wrapper">
                         <div class="file-input-btn" id="gscBtn">
-                            <div>Click or drag to upload GSC CSV</div>
+                            <div>Click or drag to upload GSC file (CSV or Excel)</div>
                             <div class="file-name" id="gscFileName"></div>
                         </div>
-                        <input type="file" name="gsc_file" id="gscFile" accept=".csv">
+                        <input type="file" name="gsc_file" id="gscFile" accept=".csv,.xlsx,.xls">
                     </div>
                 </div>
                 <div id="gscApiInfo" class="hidden" style="padding: 15px; background: #e8f8f0; border-radius: 8px; color: #155724;">
@@ -1466,10 +1466,10 @@ async def root():
                 <h3>Backlink Data <span class="optional">(Optional)</span></h3>
                 <div class="file-input-wrapper">
                     <div class="file-input-btn" id="backlinkBtn">
-                        <div>Click or drag to upload backlinks CSV (e.g., Ahrefs / Semrush / Moz per-URL export)</div>
+                        <div>Click or drag to upload backlinks file (CSV or Excel)</div>
                         <div class="file-name" id="backlinkFileName"></div>
                     </div>
-                    <input type="file" name="backlink_file" id="backlinkFile" accept=".csv">
+                    <input type="file" name="backlink_file" id="backlinkFile" accept=".csv,.xlsx,.xls">
                 </div>
                 <div class="helper-text">
                     Upload per-URL backlink metrics from your link tool (Ahrefs, Semrush, Moz, Majestic).<br>
