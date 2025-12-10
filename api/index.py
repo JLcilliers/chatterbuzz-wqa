@@ -355,14 +355,21 @@ def read_file_to_dataframe(file_content: bytes, filename: str = "") -> pd.DataFr
     if filename_lower.endswith('.xlsx') or filename_lower.endswith('.xls'):
         return pd.read_excel(io.BytesIO(file_content))
     else:
-        # Try CSV first, fall back to Excel if it fails
-        try:
-            return pd.read_csv(io.BytesIO(file_content), low_memory=False)
-        except Exception:
+        # Try CSV with different encodings, fall back to Excel if all fail
+        encodings_to_try = ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']
+        for encoding in encodings_to_try:
             try:
-                return pd.read_excel(io.BytesIO(file_content))
-            except Exception:
-                raise ValueError(f"Could not read file as CSV or Excel: {filename}")
+                return pd.read_csv(io.BytesIO(file_content), low_memory=False, encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+            except Exception as e:
+                # If it's not an encoding error, try Excel
+                break
+        # Try Excel as last resort
+        try:
+            return pd.read_excel(io.BytesIO(file_content))
+        except Exception:
+            raise ValueError(f"Could not read file as CSV or Excel: {filename}")
 
 
 def load_crawl_data(file_content: bytes, filename: str = "") -> pd.DataFrame:
