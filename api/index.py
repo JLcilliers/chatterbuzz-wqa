@@ -348,8 +348,25 @@ def classify_page_type(url: str) -> str:
 # DATA LOADING
 # =============================================================================
 
-def load_crawl_data(file_content: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_content), low_memory=False)
+def read_file_to_dataframe(file_content: bytes, filename: str = "") -> pd.DataFrame:
+    """Read file content into DataFrame, auto-detecting CSV or Excel format"""
+    filename_lower = filename.lower() if filename else ""
+
+    if filename_lower.endswith('.xlsx') or filename_lower.endswith('.xls'):
+        return pd.read_excel(io.BytesIO(file_content))
+    else:
+        # Try CSV first, fall back to Excel if it fails
+        try:
+            return pd.read_csv(io.BytesIO(file_content), low_memory=False)
+        except Exception:
+            try:
+                return pd.read_excel(io.BytesIO(file_content))
+            except Exception:
+                raise ValueError(f"Could not read file as CSV or Excel: {filename}")
+
+
+def load_crawl_data(file_content: bytes, filename: str = "") -> pd.DataFrame:
+    df = read_file_to_dataframe(file_content, filename)
     df_mapped = map_columns(df, CRAWL_COLUMN_MAP, 'Crawl')
 
     if 'indexable' in df_mapped.columns and df_mapped['indexable'] is not None:
@@ -365,10 +382,10 @@ def load_crawl_data(file_content: bytes) -> pd.DataFrame:
     return df_mapped
 
 
-def load_ga_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
+def load_ga_data(file_content: Optional[bytes], filename: str = "") -> Optional[pd.DataFrame]:
     if file_content is None:
         return None
-    df = pd.read_csv(io.BytesIO(file_content), low_memory=False)
+    df = read_file_to_dataframe(file_content, filename)
     df_mapped = map_columns(df, GA_COLUMN_MAP, 'GA4')
     # Convert numeric columns
     numeric_cols = ['sessions', 'conversions', 'bounce_rate', 'avg_session_duration', 'ecom_revenue']
@@ -378,10 +395,10 @@ def load_ga_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
     return df_mapped
 
 
-def load_gsc_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
+def load_gsc_data(file_content: Optional[bytes], filename: str = "") -> Optional[pd.DataFrame]:
     if file_content is None:
         return None
-    df = pd.read_csv(io.BytesIO(file_content), low_memory=False)
+    df = read_file_to_dataframe(file_content, filename)
     df_mapped = map_columns(df, GSC_COLUMN_MAP, 'GSC')
     for col in ['avg_position', 'ctr', 'clicks', 'impressions']:
         if col in df_mapped.columns:
@@ -389,10 +406,10 @@ def load_gsc_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
     return df_mapped
 
 
-def load_backlink_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
+def load_backlink_data(file_content: Optional[bytes], filename: str = "") -> Optional[pd.DataFrame]:
     if file_content is None:
         return None
-    df = pd.read_csv(io.BytesIO(file_content), low_memory=False)
+    df = read_file_to_dataframe(file_content, filename)
     df_mapped = map_columns(df, BACKLINK_COLUMN_MAP, 'Backlinks')
     for col in ['referring_domains', 'backlinks', 'authority']:
         if col in df_mapped.columns:
@@ -1718,14 +1735,14 @@ async def generate_report(
     gsc_site_url: str = Form(""),
     google_tokens: Optional[str] = Cookie(None)
 ):
-    """Generate WQA report from uploaded CSV files or Google API data"""
+    """Generate WQA report from uploaded CSV/Excel files or Google API data"""
     try:
         # Read crawl file (required)
         crawl_content = await crawl_file.read()
-        crawl_df = load_crawl_data(crawl_content)
+        crawl_df = load_crawl_data(crawl_content, crawl_file.filename or "")
         logger.info(f"Loaded crawl data: {len(crawl_df)} rows")
 
-        # Get GA4 data - either from API or CSV
+        # Get GA4 data - either from API or file
         ga_df = None
         if use_ga4_api == "true" and ga4_property_id and google_tokens:
             tokens = decrypt_token(google_tokens)
@@ -1736,10 +1753,10 @@ async def generate_report(
         elif ga_file and ga_file.filename:
             ga_content = await ga_file.read()
             if ga_content:
-                ga_df = load_ga_data(ga_content)
-                logger.info(f"Loaded GA4 data from CSV: {len(ga_df)} rows")
+                ga_df = load_ga_data(ga_content, ga_file.filename or "")
+                logger.info(f"Loaded GA4 data from file: {len(ga_df)} rows")
 
-        # Get GSC data - either from API or CSV
+        # Get GSC data - either from API or file
         gsc_df = None
         if use_gsc_api == "true" and gsc_site_url and google_tokens:
             tokens = decrypt_token(google_tokens)
@@ -1750,14 +1767,14 @@ async def generate_report(
         elif gsc_file and gsc_file.filename:
             gsc_content = await gsc_file.read()
             if gsc_content:
-                gsc_df = load_gsc_data(gsc_content)
-                logger.info(f"Loaded GSC data from CSV: {len(gsc_df)} rows")
+                gsc_df = load_gsc_data(gsc_content, gsc_file.filename or "")
+                logger.info(f"Loaded GSC data from file: {len(gsc_df)} rows")
 
         backlink_df = None
         if backlink_file and backlink_file.filename:
             backlink_content = await backlink_file.read()
             if backlink_content:
-                backlink_df = load_backlink_data(backlink_content)
+                backlink_df = load_backlink_data(backlink_content, backlink_file.filename or "")
                 logger.info(f"Loaded backlink data: {len(backlink_df)} rows")
 
         # Merge datasets
