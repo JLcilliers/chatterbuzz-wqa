@@ -170,12 +170,19 @@ CRAWL_COLUMN_MAP = {
     'h1': ['h1-1', 'h1', 'h1 1', 'heading 1', 'first h1'],
     'word_count': ['word count', 'word_count', 'words', 'content_word_count', 'text_word_count',
                    'text content', 'body word count'],
+    'last_modified': ['last modified', 'last_modified', 'lastmod', 'modified', 'date modified',
+                      'last-modified', 'modified date'],
 }
 
 GA_COLUMN_MAP = {
     'url': ['url', 'page_path', 'page', 'landing_page', 'page_location'],
     'sessions': ['sessions', 'session_count', 'visits'],
     'conversions': ['conversions', 'goal_completions', 'conversion_count', 'key_events'],
+    'bounce_rate': ['bounce_rate', 'bounceRate', 'bounce rate'],
+    'avg_session_duration': ['avg_session_duration', 'averageSessionDuration', 'average session duration',
+                             'session_duration', 'avgSessionDuration'],
+    'ecom_revenue': ['ecom_revenue', 'revenue', 'transactionRevenue', 'purchaseRevenue', 'totalRevenue',
+                     'ecommerce_revenue', 'total_revenue'],
 }
 
 GSC_COLUMN_MAP = {
@@ -363,7 +370,9 @@ def load_ga_data(file_content: Optional[bytes]) -> Optional[pd.DataFrame]:
         return None
     df = pd.read_csv(io.BytesIO(file_content), low_memory=False)
     df_mapped = map_columns(df, GA_COLUMN_MAP, 'GA4')
-    for col in ['sessions', 'conversions']:
+    # Convert numeric columns
+    numeric_cols = ['sessions', 'conversions', 'bounce_rate', 'avg_session_duration', 'ecom_revenue']
+    for col in numeric_cols:
         if col in df_mapped.columns:
             df_mapped[col] = pd.to_numeric(df_mapped[col], errors='coerce').fillna(0)
     return df_mapped
@@ -404,8 +413,23 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
         ga_df = ga_df.copy()
         ga_df['url'] = ga_df['url'].apply(normalize_url)
         ga_df = ga_df[ga_df['url'] != '']
-        ga_agg = ga_df.groupby('url').agg({'sessions': 'sum', 'conversions': 'sum'}).reset_index()
-        df = df.merge(ga_agg, on='url', how='left', suffixes=('', '_ga'))
+        # Build aggregation dict dynamically based on available columns
+        ga_agg_cols = {}
+        if 'sessions' in ga_df.columns:
+            ga_agg_cols['sessions'] = 'sum'
+        if 'conversions' in ga_df.columns:
+            ga_agg_cols['conversions'] = 'sum'
+        if 'bounce_rate' in ga_df.columns:
+            ga_agg_cols['bounce_rate'] = 'mean'
+        if 'avg_session_duration' in ga_df.columns:
+            ga_agg_cols['avg_session_duration'] = 'mean'
+        if 'ecom_revenue' in ga_df.columns:
+            ga_agg_cols['ecom_revenue'] = 'sum'
+        if 'sessions_prev' in ga_df.columns:
+            ga_agg_cols['sessions_prev'] = 'sum'
+        if ga_agg_cols:
+            ga_agg = ga_df.groupby('url').agg(ga_agg_cols).reset_index()
+            df = df.merge(ga_agg, on='url', how='left', suffixes=('', '_ga'))
 
     if gsc_df is not None and 'url' in gsc_df.columns:
         gsc_df = gsc_df.copy()
@@ -442,13 +466,19 @@ def merge_datasets(crawl_df, ga_df, gsc_df, backlink_df) -> pd.DataFrame:
             df = df.merge(bl_agg, on='url', how='left', suffixes=('', '_bl'))
 
     expected_columns = {
+        # Crawl data columns
         'url': '', 'status_code': 0, 'indexable': True, 'canonical_url': '',
         'meta_robots': '', 'content_type': '', 'h1': '',
         'inlinks': 0, 'outlinks': 0, 'crawl_depth': 0, 'in_sitemap': False,
         'page_title': '', 'meta_description': '', 'word_count': 0,
-        'sessions': 0, 'conversions': 0, 'avg_position': 0.0, 'ctr': 0.0,
-        'clicks': 0, 'impressions': 0, 'referring_domains': 0, 'backlinks': 0,
-        'authority': 0, 'primary_keyword': '',
+        'last_modified': '',
+        # GA data columns
+        'sessions': 0, 'conversions': 0, 'bounce_rate': 0.0, 'avg_session_duration': 0.0,
+        'ecom_revenue': 0.0, 'sessions_prev': 0,
+        # GSC data columns
+        'avg_position': 0.0, 'ctr': 0.0, 'clicks': 0, 'impressions': 0, 'primary_keyword': '',
+        # Backlink data columns
+        'referring_domains': 0, 'backlinks': 0, 'authority': 0,
     }
 
     for col, default in expected_columns.items():
@@ -621,26 +651,230 @@ def generate_summary(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     return summaries
 
 
+def extract_page_path(url: str) -> str:
+    """Extract page path from URL (no protocol, no domain, no querystring)"""
+    if pd.isna(url) or not url:
+        return '/'
+    try:
+        parsed = urlparse(str(url))
+        path = parsed.path if parsed.path else '/'
+        # Ensure path starts with /
+        if not path.startswith('/'):
+            path = '/' + path
+        return path
+    except:
+        return '/'
+
+
+def format_indexability(row) -> Tuple[str, str]:
+    """Return (Index/Noindex label, Indexation Status explanation)"""
+    indexable = row.get('indexable', True)
+    meta_robots = str(row.get('meta_robots', '')).lower()
+    status_code = int(row.get('status_code', 200))
+    canonical = str(row.get('canonical_url', '')).strip()
+    url = str(row.get('url', '')).strip().lower()
+
+    # Determine index/noindex
+    if status_code >= 400:
+        index_label = 'Non-Indexable'
+        status_label = f'{status_code} Error'
+    elif 'noindex' in meta_robots:
+        index_label = 'Non-Indexable'
+        status_label = 'Noindex'
+    elif not indexable:
+        index_label = 'Non-Indexable'
+        if canonical and canonical.lower() != url:
+            status_label = 'Canonicalised'
+        else:
+            status_label = 'Non-Indexable'
+    else:
+        index_label = 'Indexable'
+        status_label = 'Indexable'
+
+    return index_label, status_label
+
+
 def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) -> bytes:
+    """Create WQA Excel report with proper 3-header-row structure"""
     output = io.BytesIO()
 
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Aggregation', index=False)
+    # Define the 38-column structure
+    # Row 1: Section headings (sparse)
+    section_headers = {
+        0: '', 1: 'ANALYSIS', 2: '', 3: '', 4: '', 5: '',
+        6: 'KEYWORD PERFORMANCE', 7: '', 8: '', 9: '', 10: '', 11: '',
+        12: 'TRAFFIC PERFORMANCE', 13: '', 14: '', 15: '',
+        16: 'ENGAGEMENT', 17: '',
+        18: 'CONVERSIONS', 19: '', 20: '', 21: '',
+        22: 'ON PAGE', 23: '', 24: '', 25: '', 26: '', 27: '', 28: '', 29: '', 30: '',
+        31: 'TECHNICAL', 32: '', 33: '', 34: '', 35: '', 36: '', 37: ''
+    }
 
-        action_columns = [
-            'url', 'page_type', 'status_code', 'sessions', 'avg_position',
-            'referring_domains', 'backlinks', 'word_count', 'inlinks',
-            'technical_actions', 'content_actions', 'priority'
+    # Row 2: Source labels
+    source_labels = {
+        0: 'Formula', 1: 'SF', 2: 'Manual', 3: 'Manual', 4: 'Manual', 5: 'Manual',
+        6: 'SEMrush', 7: 'SEMrush', 8: 'SEMrush', 9: 'SEMrush', 10: 'SEMrush', 11: 'SEMrush',
+        12: 'GSC', 13: 'GA', 14: 'GA', 15: 'GA',
+        16: 'GA', 17: 'GA',
+        18: 'GA', 19: 'GA', 20: 'GA', 21: 'GA',
+        22: 'SF', 23: 'SF', 24: 'GSC', 25: 'SF', 26: 'SF', 27: 'SF', 28: 'SF', 29: 'SF', 30: 'Ahrefs',
+        31: 'SF', 32: 'SF', 33: 'SF', 34: 'SF', 35: 'SF', 36: 'Formula', 37: 'SF'
+    }
+
+    # Row 3: Column names
+    column_names = [
+        'page-path', 'URL', 'Category', 'Technical Action', 'Content Action', 'Final URL',
+        'Main KW', 'Volume', 'Ranking', '"Best" KW', 'Volume', 'Ranking',
+        'Impressions', 'Sessions', '% Change Sessions', 'Losing Traffic?',
+        'Bounce rate (%)', 'Average session duration',
+        'Conversions (All Goals)', 'Conversion Rate (%)', 'Ecom Revenue Generated', 'Ecom Conversion Rate',
+        'Type', 'Current Title', 'SERP CTR', 'Meta', 'H1', 'Word Count', 'Inlinks', 'Outlinks', 'DOFOLLOW Links',
+        'Canonical Link Element', 'Status Code', 'Index / Noindex', 'Indexation Status', 'Page Depth', 'In Sitemap?', 'Last Modified'
+    ]
+
+    # Build data rows
+    data_rows = []
+    for _, row in df.iterrows():
+        # Get canonical URL or regular URL
+        canonical = str(row.get('canonical_url', '')).strip()
+        url = str(row.get('url', '')).strip()
+        display_url = canonical if canonical and canonical != '' else url
+
+        # Extract page path
+        page_path = extract_page_path(display_url)
+
+        # Get indexability info
+        index_label, indexation_status = format_indexability(row)
+
+        # Calculate conversion rate
+        sessions = float(row.get('sessions', 0))
+        conversions = float(row.get('conversions', 0))
+        conv_rate = (conversions / sessions) if sessions > 0 else ''
+
+        # Calculate % change sessions and losing traffic
+        sessions_prev = float(row.get('sessions_prev', 0))
+        if sessions_prev > 0:
+            pct_change = (sessions - sessions_prev) / sessions_prev
+            losing_traffic = 'Yes' if pct_change <= -0.1 else 'No'
+        else:
+            pct_change = ''
+            losing_traffic = 'No YoY Data'
+
+        # Format in_sitemap
+        in_sitemap = 'Yes' if row.get('in_sitemap', False) else 'No'
+
+        # Build row data matching column order
+        data_row = [
+            page_path,                                          # 0: page-path
+            display_url,                                        # 1: URL
+            row.get('page_type', 'Other'),                      # 2: Category
+            row.get('technical_actions', ''),                   # 3: Technical Action
+            row.get('content_actions', ''),                     # 4: Content Action
+            row.get('final_url', ''),                           # 5: Final URL
+            row.get('main_kw', ''),                             # 6: Main KW
+            row.get('main_kw_volume', ''),                      # 7: Volume (Main KW)
+            row.get('main_kw_ranking', ''),                     # 8: Ranking (Main KW)
+            row.get('primary_keyword', ''),                     # 9: "Best" KW (from GSC)
+            row.get('best_kw_volume', ''),                      # 10: Volume (Best KW)
+            row.get('avg_position', ''),                        # 11: Ranking (Best KW) - using GSC position
+            row.get('impressions', 0),                          # 12: Impressions
+            sessions if sessions > 0 else '',                   # 13: Sessions
+            pct_change,                                         # 14: % Change Sessions
+            losing_traffic,                                     # 15: Losing Traffic?
+            row.get('bounce_rate', ''),                         # 16: Bounce rate (%)
+            row.get('avg_session_duration', ''),                # 17: Average session duration
+            conversions if conversions > 0 else '',             # 18: Conversions (All Goals)
+            conv_rate,                                          # 19: Conversion Rate (%)
+            row.get('ecom_revenue', ''),                        # 20: Ecom Revenue Generated
+            row.get('ecom_conv_rate', ''),                      # 21: Ecom Conversion Rate
+            row.get('content_type', ''),                        # 22: Type
+            row.get('page_title', ''),                          # 23: Current Title
+            row.get('ctr', ''),                                 # 24: SERP CTR
+            row.get('meta_description', ''),                    # 25: Meta
+            row.get('h1', ''),                                  # 26: H1
+            row.get('word_count', 0),                           # 27: Word Count
+            row.get('inlinks', 0),                              # 28: Inlinks
+            row.get('outlinks', 0),                             # 29: Outlinks
+            row.get('backlinks', 0),                            # 30: DOFOLLOW Links
+            row.get('canonical_url', ''),                       # 31: Canonical Link Element
+            row.get('status_code', ''),                         # 32: Status Code
+            index_label,                                        # 33: Index / Noindex
+            indexation_status,                                  # 34: Indexation Status
+            row.get('crawl_depth', ''),                         # 35: Page Depth
+            in_sitemap,                                         # 36: In Sitemap?
+            row.get('last_modified', ''),                       # 37: Last Modified
         ]
-        action_columns = [col for col in action_columns if col in df.columns]
-        df_actions = df[action_columns].copy()
-        priority_map = {'High': 0, 'Medium': 1, 'Low': 2}
-        df_actions['priority_sort'] = df_actions['priority'].map(priority_map)
-        df_actions = df_actions.sort_values(
-            ['priority_sort', 'sessions'], ascending=[True, False]
-        ).drop('priority_sort', axis=1)
-        df_actions.to_excel(writer, sheet_name='Actions', index=False)
+        data_rows.append(data_row)
 
+    # Create DataFrame with proper structure
+    wqa_df = pd.DataFrame(data_rows, columns=column_names)
+
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Write WQA sheet with 3 header rows
+        workbook = writer.book
+        worksheet = workbook.create_sheet('WQA', 0)
+
+        # Row 1: Section headers
+        for col_idx, header in section_headers.items():
+            worksheet.cell(row=1, column=col_idx + 1, value=header)
+
+        # Row 2: Source labels
+        for col_idx, source in source_labels.items():
+            worksheet.cell(row=2, column=col_idx + 1, value=source)
+
+        # Row 3: Column names
+        for col_idx, col_name in enumerate(column_names):
+            worksheet.cell(row=3, column=col_idx + 1, value=col_name)
+
+        # Row 4+: Data rows
+        for row_idx, data_row in enumerate(data_rows):
+            for col_idx, value in enumerate(data_row):
+                worksheet.cell(row=row_idx + 4, column=col_idx + 1, value=value)
+
+        # Apply some basic formatting
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        # Header row styling
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font = Font(color='FFFFFF', bold=True)
+
+        for col_idx in range(len(column_names)):
+            # Section headers (Row 1) - only style cells with content
+            cell1 = worksheet.cell(row=1, column=col_idx + 1)
+            if cell1.value:
+                cell1.fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+                cell1.font = Font(color='FFFFFF', bold=True, size=12)
+
+            # Source labels (Row 2)
+            cell2 = worksheet.cell(row=2, column=col_idx + 1)
+            cell2.fill = PatternFill(start_color='D6DCE5', end_color='D6DCE5', fill_type='solid')
+            cell2.font = Font(italic=True, size=9)
+
+            # Column names (Row 3)
+            cell3 = worksheet.cell(row=3, column=col_idx + 1)
+            cell3.fill = header_fill
+            cell3.font = header_font
+
+        # Freeze panes at row 4 (after headers)
+        worksheet.freeze_panes = 'A4'
+
+        # Auto-adjust column widths (basic)
+        for col_idx, col_name in enumerate(column_names):
+            col_letter = worksheet.cell(row=1, column=col_idx + 1).column_letter
+            # Set reasonable default widths based on column type
+            if col_name in ['URL', 'Canonical Link Element', 'Meta', 'Current Title']:
+                worksheet.column_dimensions[col_letter].width = 50
+            elif col_name in ['page-path', 'Final URL', 'H1']:
+                worksheet.column_dimensions[col_letter].width = 35
+            elif col_name in ['Technical Action', 'Content Action', 'Category', 'Indexation Status']:
+                worksheet.column_dimensions[col_letter].width = 20
+            else:
+                worksheet.column_dimensions[col_letter].width = 15
+
+        # Also write the raw aggregation data to a separate sheet for reference
+        df.to_excel(writer, sheet_name='Raw Data', index=False)
+
+        # Write summary sheet
         current_row = 0
         summary_order = [
             ('Priority Distribution', 'priority'),
