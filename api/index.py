@@ -1671,8 +1671,9 @@ def create_excel_report(
                         pass
 
         # Auto-adjust column widths (basic)
+        from openpyxl.utils import get_column_letter
         for col_idx, col_name in enumerate(column_names):
-            col_letter = worksheet.cell(row=1, column=col_idx + 1).column_letter
+            col_letter = get_column_letter(col_idx + 1)
             # Set reasonable default widths based on column type
             if col_name in ['URL', 'Canonical Link Element', 'Meta', 'Current Title']:
                 worksheet.column_dimensions[col_letter].width = 50
