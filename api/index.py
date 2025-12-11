@@ -708,6 +708,268 @@ def load_backlink_data(file_content: Optional[bytes], filename: str = "") -> Opt
 
 
 # =============================================================================
+# DATA QUALITY VALIDATION
+# =============================================================================
+
+class DataQualityReport:
+    """Container for data quality validation results."""
+
+    def __init__(self):
+        self.missing_columns: Dict[str, List[str]] = {}
+        self.empty_columns: List[str] = []
+        self.sparse_columns: Dict[str, float] = {}
+        self.url_match_stats: Dict[str, Dict] = {}
+        self.data_source_coverage: Dict[str, int] = {}
+        self.issues: List[Dict] = []
+        self.warnings: List[str] = []
+
+    def add_issue(self, category: str, severity: str, description: str,
+                  affected_count: int = 0, examples: List[str] = None):
+        """Add a specific data quality issue."""
+        self.issues.append({
+            'category': category,
+            'severity': severity,
+            'description': description,
+            'affected_count': affected_count,
+            'examples': examples or []
+        })
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """Convert issues to a DataFrame for Excel export."""
+        if not self.issues:
+            return pd.DataFrame(columns=['Category', 'Severity', 'Description', 'Affected Count', 'Examples'])
+
+        rows = []
+        for issue in self.issues:
+            rows.append({
+                'Category': issue['category'],
+                'Severity': issue['severity'],
+                'Description': issue['description'],
+                'Affected Count': issue['affected_count'],
+                'Examples': '; '.join(str(e) for e in issue['examples'][:5]) if issue['examples'] else ''
+            })
+
+        return pd.DataFrame(rows)
+
+
+def validate_data_quality(
+    merged_df: pd.DataFrame,
+    crawl_df: pd.DataFrame,
+    ga_df: Optional[pd.DataFrame],
+    gsc_df: Optional[pd.DataFrame],
+    backlink_df: Optional[pd.DataFrame]
+) -> DataQualityReport:
+    """
+    Validate merged data quality and identify missing/problematic data.
+    """
+    report = DataQualityReport()
+    total_urls = len(merged_df)
+
+    logger.info("=" * 60)
+    logger.info("DATA QUALITY VALIDATION")
+    logger.info("=" * 60)
+
+    crawl_urls = set(merged_df['url'].dropna().unique())
+
+    # GA4 URL matching
+    if ga_df is not None:
+        if 'page_path' in ga_df.columns:
+            # API uses page_path for GA joining
+            ga_paths = set(ga_df['page_path'].apply(normalize_page_path).dropna().unique())
+            ga_paths = ga_paths - {''}
+            crawl_paths = set(merged_df['page_path'].dropna().unique()) if 'page_path' in merged_df.columns else set()
+            matched_ga = crawl_paths & ga_paths
+            unmatched_ga = ga_paths - crawl_paths
+            total_ga = len(ga_paths)
+        elif 'url' in ga_df.columns:
+            ga_urls = set(ga_df['url'].apply(normalize_url).dropna().unique())
+            ga_urls = ga_urls - {''}
+            matched_ga = crawl_urls & ga_urls
+            unmatched_ga = ga_urls - crawl_urls
+            total_ga = len(ga_urls)
+        else:
+            matched_ga = set()
+            unmatched_ga = set()
+            total_ga = 0
+
+        report.data_source_coverage['GA4'] = len(matched_ga)
+        report.url_match_stats['GA4'] = {
+            'total_source_urls': total_ga,
+            'matched': len(matched_ga),
+            'unmatched': len(unmatched_ga),
+            'match_rate': len(matched_ga) / total_ga * 100 if total_ga else 0
+        }
+
+        logger.info(f"GA4: {len(matched_ga)}/{total_ga} URLs matched ({report.url_match_stats['GA4']['match_rate']:.1f}%)")
+
+        if report.url_match_stats['GA4']['match_rate'] < 50 and total_ga > 0:
+            report.add_issue(
+                category='URL Matching',
+                severity='High',
+                description=f'GA4 URL match rate is low ({report.url_match_stats["GA4"]["match_rate"]:.1f}%). Check URL format differences.',
+                affected_count=len(unmatched_ga),
+                examples=list(unmatched_ga)[:10]
+            )
+    else:
+        report.data_source_coverage['GA4'] = 0
+        report.warnings.append('GA4 data not provided - sessions/conversions will be 0')
+
+    # GSC URL matching
+    if gsc_df is not None and 'url' in gsc_df.columns:
+        gsc_urls = set(gsc_df['url'].apply(normalize_url).dropna().unique())
+        gsc_urls = gsc_urls - {''}
+        matched_gsc = crawl_urls & gsc_urls
+        unmatched_gsc = gsc_urls - crawl_urls
+
+        report.data_source_coverage['GSC'] = len(matched_gsc)
+        report.url_match_stats['GSC'] = {
+            'total_source_urls': len(gsc_urls),
+            'matched': len(matched_gsc),
+            'unmatched': len(unmatched_gsc),
+            'match_rate': len(matched_gsc) / len(gsc_urls) * 100 if gsc_urls else 0
+        }
+
+        logger.info(f"GSC: {len(matched_gsc)}/{len(gsc_urls)} URLs matched ({report.url_match_stats['GSC']['match_rate']:.1f}%)")
+
+        if report.url_match_stats['GSC']['match_rate'] < 50:
+            report.add_issue(
+                category='URL Matching',
+                severity='High',
+                description=f'GSC URL match rate is low ({report.url_match_stats["GSC"]["match_rate"]:.1f}%). Check URL format differences.',
+                affected_count=len(unmatched_gsc),
+                examples=list(unmatched_gsc)[:10]
+            )
+    else:
+        report.data_source_coverage['GSC'] = 0
+        report.warnings.append('GSC data not provided - rankings/CTR will be 0')
+
+    # Backlink URL matching
+    if backlink_df is not None and 'url' in backlink_df.columns:
+        bl_urls = set(backlink_df['url'].apply(normalize_url).dropna().unique())
+        bl_urls = bl_urls - {''}
+        matched_bl = crawl_urls & bl_urls
+        unmatched_bl = bl_urls - crawl_urls
+
+        report.data_source_coverage['Backlinks'] = len(matched_bl)
+        report.url_match_stats['Backlinks'] = {
+            'total_source_urls': len(bl_urls),
+            'matched': len(matched_bl),
+            'unmatched': len(unmatched_bl),
+            'match_rate': len(matched_bl) / len(bl_urls) * 100 if bl_urls else 0
+        }
+
+        logger.info(f"Backlinks: {len(matched_bl)}/{len(bl_urls)} URLs matched ({report.url_match_stats['Backlinks']['match_rate']:.1f}%)")
+
+        if report.url_match_stats['Backlinks']['match_rate'] < 50:
+            report.add_issue(
+                category='URL Matching',
+                severity='High',
+                description=f'Backlink URL match rate is low ({report.url_match_stats["Backlinks"]["match_rate"]:.1f}%). Check URL format differences.',
+                affected_count=len(unmatched_bl),
+                examples=list(unmatched_bl)[:10]
+            )
+    else:
+        report.data_source_coverage['Backlinks'] = 0
+        report.warnings.append('Backlink data not provided - referring_domains/backlinks will be 0')
+
+    # Check for empty/sparse columns
+    critical_columns = {
+        'sessions': ('GA4', 0),
+        'conversions': ('GA4', 0),
+        'avg_position': ('GSC', 0.0),
+        'ctr': ('GSC', 0.0),
+        'clicks': ('GSC', 0),
+        'impressions': ('GSC', 0),
+        'primary_keyword': ('GSC', ''),
+        'referring_domains': ('Backlinks', 0),
+        'backlinks': ('Backlinks', 0),
+        'word_count': ('Crawl', 0),
+        'page_title': ('Crawl', ''),
+        'meta_description': ('Crawl', ''),
+    }
+
+    for col, (source, default) in critical_columns.items():
+        if col not in merged_df.columns:
+            report.empty_columns.append(col)
+            continue
+
+        if isinstance(default, str):
+            empty_mask = (merged_df[col].isna()) | (merged_df[col] == '') | (merged_df[col] == default)
+        else:
+            empty_mask = (merged_df[col].isna()) | (merged_df[col] == default)
+
+        empty_count = empty_mask.sum()
+        empty_pct = empty_count / total_urls * 100 if total_urls > 0 else 0
+        report.sparse_columns[col] = empty_pct
+
+        if empty_pct == 100:
+            report.empty_columns.append(col)
+            report.add_issue(
+                category='Empty Column',
+                severity='High',
+                description=f'Column "{col}" has no data (100% empty/default). Source: {source}',
+                affected_count=empty_count
+            )
+        elif empty_pct >= 90:
+            report.add_issue(
+                category='Sparse Data',
+                severity='High',
+                description=f'Column "{col}" is {empty_pct:.1f}% empty/default. Source: {source}',
+                affected_count=empty_count
+            )
+
+    # Check data inconsistencies
+    if 'sessions' in merged_df.columns and 'avg_position' in merged_df.columns:
+        traffic_no_rank = merged_df[(merged_df['sessions'] > 0) & (merged_df['avg_position'] == 0)]
+        if len(traffic_no_rank) > 0:
+            report.add_issue(
+                category='Data Inconsistency',
+                severity='Medium',
+                description=f'URLs with traffic but no GSC ranking data.',
+                affected_count=len(traffic_no_rank),
+                examples=list(traffic_no_rank['url'].head(10))
+            )
+
+    high_issues = sum(1 for i in report.issues if i['severity'] == 'High')
+    medium_issues = sum(1 for i in report.issues if i['severity'] == 'Medium')
+
+    logger.info(f"Data Quality: {len(report.issues)} issues ({high_issues} High, {medium_issues} Medium)")
+    logger.info("=" * 60)
+
+    return report
+
+
+def generate_data_quality_sheets(report: DataQualityReport) -> Dict[str, pd.DataFrame]:
+    """Generate DataFrames for data quality reporting in Excel."""
+    sheets = {}
+
+    sheets['issues'] = report.to_dataframe()
+
+    coverage_data = []
+    for source, count in report.data_source_coverage.items():
+        stats = report.url_match_stats.get(source, {})
+        coverage_data.append({
+            'Data Source': source,
+            'URLs Matched': count,
+            'Total Source URLs': stats.get('total_source_urls', 'N/A'),
+            'Match Rate (%)': f"{stats.get('match_rate', 0):.1f}" if stats else 'N/A',
+            'Unmatched URLs': stats.get('unmatched', 0)
+        })
+    sheets['coverage'] = pd.DataFrame(coverage_data)
+
+    sparsity_data = []
+    for col, pct in sorted(report.sparse_columns.items(), key=lambda x: -x[1]):
+        sparsity_data.append({
+            'Column': col,
+            'Empty/Default (%)': f"{pct:.1f}",
+            'Status': 'Critical' if pct >= 90 else ('Warning' if pct >= 70 else 'OK')
+        })
+    sheets['column_quality'] = pd.DataFrame(sparsity_data)
+
+    return sheets
+
+
+# =============================================================================
 # MERGING & PROCESSING
 # =============================================================================
 
@@ -1151,8 +1413,12 @@ def format_indexability(row) -> Tuple[str, str]:
     return index_label, status_reason
 
 
-def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) -> bytes:
-    """Create WQA Excel report with proper 3-header-row structure"""
+def create_excel_report(
+    df: pd.DataFrame,
+    summaries: Dict[str, pd.DataFrame],
+    quality_report: Optional[DataQualityReport] = None
+) -> bytes:
+    """Create WQA Excel report with proper 3-header-row structure and data quality sheet"""
     output = io.BytesIO()
 
     # Define the 38-column structure
@@ -1283,9 +1549,32 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
         workbook = writer.book
         worksheet = workbook.create_sheet('WQA', 0)
 
-        # Row 1: Section headers
-        for col_idx, header in section_headers.items():
-            worksheet.cell(row=1, column=col_idx + 1, value=header)
+        # Row 1: Section headers with merging and distinct colors
+        # Define merge ranges and their labels/colors
+        # A1:F1 (cols 1-6), G1:L1 (cols 7-12), M1:P1 (cols 13-16), Q1:R1 (cols 17-18),
+        # S1:V1 (cols 19-22), W1:AE1 (cols 23-31), AF1:AL1 (cols 32-38)
+        section_merges = [
+            ('A1:F1', 'ANALYSIS', '2F5496'),           # Dark Blue
+            ('G1:L1', 'KEYWORD PERFORMANCE', '548235'), # Dark Green
+            ('M1:P1', 'TRAFFIC PERFORMANCE', 'C65911'), # Dark Orange
+            ('Q1:R1', 'ENGAGEMENT', '7030A0'),          # Purple
+            ('S1:V1', 'CONVERSIONS', 'BF8F00'),         # Dark Gold
+            ('W1:AE1', 'ON PAGE', '385723'),            # Forest Green
+            ('AF1:AL1', 'TECHNICAL', '833C0C'),         # Dark Brown
+        ]
+
+        from openpyxl.styles import Font, PatternFill, Alignment
+
+        for merge_range, label, color in section_merges:
+            # Merge the cells
+            worksheet.merge_cells(merge_range)
+            # Get the first cell of the merged range to set value and style
+            first_cell = merge_range.split(':')[0]
+            cell = worksheet[first_cell]
+            cell.value = label
+            cell.fill = PatternFill(start_color=color, end_color=color, fill_type='solid')
+            cell.font = Font(color='FFFFFF', bold=True, size=12)
+            cell.alignment = Alignment(horizontal='center', vertical='center')
 
         # Row 2: Source labels
         for col_idx, source in source_labels.items():
@@ -1300,21 +1589,14 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
             for col_idx, value in enumerate(data_row):
                 worksheet.cell(row=row_idx + 4, column=col_idx + 1, value=value)
 
-        # Apply some basic formatting
-        from openpyxl.styles import Font, PatternFill, Alignment
+        # Apply formatting to Row 2 and Row 3 (Row 1 already styled with merges above)
         from openpyxl.styles.numbers import FORMAT_PERCENTAGE_00, FORMAT_NUMBER_COMMA_SEPARATED1
 
-        # Header row styling
+        # Header row styling for Row 3
         header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
         header_font = Font(color='FFFFFF', bold=True)
 
         for col_idx in range(len(column_names)):
-            # Section headers (Row 1) - only style cells with content
-            cell1 = worksheet.cell(row=1, column=col_idx + 1)
-            if cell1.value:
-                cell1.fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
-                cell1.font = Font(color='FFFFFF', bold=True, size=12)
-
             # Source labels (Row 2)
             cell2 = worksheet.cell(row=2, column=col_idx + 1)
             cell2.fill = PatternFill(start_color='D6DCE5', end_color='D6DCE5', fill_type='solid')
@@ -1422,6 +1704,67 @@ def create_excel_report(df: pd.DataFrame, summaries: Dict[str, pd.DataFrame]) ->
                 summaries[key].to_excel(writer, sheet_name='Summary', index=False,
                                         startrow=current_row)
                 current_row += len(summaries[key]) + 3
+
+        # Sheet 4: Data Quality (if provided)
+        if quality_report is not None:
+            quality_sheets = generate_data_quality_sheets(quality_report)
+            current_row = 0
+
+            # Write header
+            header_df = pd.DataFrame([['DATA QUALITY REPORT']], columns=[''])
+            header_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                              header=False, startrow=current_row)
+            current_row += 2
+
+            # Write Data Source Coverage
+            title_df = pd.DataFrame([['Data Source Coverage']], columns=[''])
+            title_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                             header=False, startrow=current_row)
+            current_row += 1
+
+            if not quality_sheets['coverage'].empty:
+                quality_sheets['coverage'].to_excel(writer, sheet_name='Data Quality',
+                                                    index=False, startrow=current_row)
+                current_row += len(quality_sheets['coverage']) + 3
+
+            # Write Column Quality
+            title_df = pd.DataFrame([['Column Data Quality']], columns=[''])
+            title_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                             header=False, startrow=current_row)
+            current_row += 1
+
+            if not quality_sheets['column_quality'].empty:
+                quality_sheets['column_quality'].to_excel(writer, sheet_name='Data Quality',
+                                                          index=False, startrow=current_row)
+                current_row += len(quality_sheets['column_quality']) + 3
+
+            # Write Issues
+            title_df = pd.DataFrame([['Data Quality Issues']], columns=[''])
+            title_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                             header=False, startrow=current_row)
+            current_row += 1
+
+            if not quality_sheets['issues'].empty:
+                quality_sheets['issues'].to_excel(writer, sheet_name='Data Quality',
+                                                  index=False, startrow=current_row)
+                current_row += len(quality_sheets['issues']) + 3
+            else:
+                no_issues_df = pd.DataFrame([['No data quality issues found!']], columns=[''])
+                no_issues_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                                     header=False, startrow=current_row)
+
+            # Write warnings if any
+            if quality_report.warnings:
+                current_row += 2
+                title_df = pd.DataFrame([['Warnings']], columns=[''])
+                title_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                                 header=False, startrow=current_row)
+                current_row += 1
+                warnings_df = pd.DataFrame([[w] for w in quality_report.warnings], columns=['Warning'])
+                warnings_df.to_excel(writer, sheet_name='Data Quality', index=False,
+                                    startrow=current_row)
+
+            logger.info(f"Wrote Data Quality sheet: {len(quality_report.issues)} issues found")
 
     output.seek(0)
     return output.getvalue()
@@ -2444,8 +2787,16 @@ async def generate_report(
         # Generate summary
         summaries = generate_summary(df)
 
-        # Create Excel report
-        excel_bytes = create_excel_report(df, summaries)
+        # Validate data quality
+        quality_report = validate_data_quality(df, crawl_df, ga_df, gsc_df, backlink_df)
+
+        # Log data quality warnings
+        high_issues = sum(1 for i in quality_report.issues if i['severity'] == 'High')
+        if high_issues > 0:
+            logger.warning(f"ATTENTION: {high_issues} high-severity data quality issues found!")
+
+        # Create Excel report with data quality sheet
+        excel_bytes = create_excel_report(df, summaries, quality_report)
 
         return StreamingResponse(
             io.BytesIO(excel_bytes),
