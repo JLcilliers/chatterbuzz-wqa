@@ -2089,6 +2089,224 @@ def build_redirect_merge_plan_api(new_content_df: pd.DataFrame) -> pd.DataFrame:
     return result_df
 
 
+def build_merge_playbooks_api(new_content_df: pd.DataFrame, gsc_df: Optional[pd.DataFrame] = None, url_word_counts: Optional[dict] = None) -> pd.DataFrame:
+    """
+    Build the 'Merge Playbooks' sheet with content-level merge instructions - API version.
+
+    For each "Consolidate pages" action, generates detailed content recommendations
+    on what to keep from the Primary URL and what to move from Secondary URLs.
+
+    Args:
+        new_content_df: DataFrame from build_new_content_opportunities_api
+            containing Recommended Action, Primary URL, Secondary URLs, etc.
+        gsc_df: Raw GSC query-level data for analyzing per-URL query coverage
+        url_word_counts: Dict mapping URL -> word count (optional)
+
+    Returns:
+        DataFrame with columns: Topic, Primary URL, Secondary URL, Keep This Content,
+        Move These Sections, Retire This Page, Reasoning
+    """
+    empty_columns = [
+        'Topic', 'Primary URL', 'Secondary URL', 'Keep This Content',
+        'Move These Sections', 'Retire This Page', 'Reasoning'
+    ]
+
+    if new_content_df is None or len(new_content_df) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    # Filter for consolidation actions only
+    consolidations = new_content_df[
+        new_content_df['Recommended Action'] == 'Consolidate pages'
+    ].copy()
+
+    if len(consolidations) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    if url_word_counts is None:
+        url_word_counts = {}
+
+    # Build URL -> queries mapping from GSC data if available
+    url_queries = {}  # url -> list of {query, impressions, clicks, position}
+    if gsc_df is not None and len(gsc_df) > 0:
+        gsc_copy = gsc_df.copy()
+
+        # Find query column
+        query_col = None
+        for col in ['query', 'primary_keyword', 'Query', 'Keyword', 'Top queries']:
+            if col in gsc_copy.columns:
+                query_col = col
+                break
+
+        # Find URL column
+        url_col = None
+        for col in ['url', 'URL', 'page', 'Page', 'landing_page']:
+            if col in gsc_copy.columns:
+                url_col = col
+                break
+
+        if query_col and url_col:
+            for _, row in gsc_copy.iterrows():
+                url = str(row.get(url_col, '')).strip()
+                query = str(row.get(query_col, '')).strip()
+                if url and query and query != 'nan':
+                    if url not in url_queries:
+                        url_queries[url] = []
+                    url_queries[url].append({
+                        'query': query,
+                        'impressions': int(row.get('impressions', 0)),
+                        'clicks': int(row.get('clicks', 0)),
+                        'position': float(row.get('avg_position', row.get('position', 0)))
+                    })
+
+    playbook_rows = []
+
+    for _, row in consolidations.iterrows():
+        topic = row.get('Suggested Topic', '')
+        primary_url = row.get('Primary URL', '')
+        secondary_urls_str = row.get('Secondary URLs', '')
+
+        # Skip if no primary URL or secondary URLs
+        if not primary_url or not secondary_urls_str:
+            continue
+
+        # Parse secondary URLs (comma-separated)
+        secondary_urls = [
+            url.strip() for url in secondary_urls_str.split(',')
+            if url.strip() and url.strip() != primary_url
+        ]
+
+        if not secondary_urls:
+            continue
+
+        # Get Primary URL's queries
+        primary_queries = url_queries.get(primary_url, [])
+        primary_query_set = {q['query'].lower() for q in primary_queries}
+        primary_word_count = url_word_counts.get(primary_url, 0)
+
+        # Calculate total impressions for Primary URL
+        primary_total_impressions = sum(q['impressions'] for q in primary_queries)
+
+        # Build "Keep This Content" for Primary URL
+        keep_content_bullets = []
+
+        if primary_queries:
+            # Group by position ranges
+            top_position_queries = [q for q in primary_queries if q['position'] > 0 and q['position'] <= 5]
+            strong_position_queries = [q for q in primary_queries if q['position'] > 5 and q['position'] <= 10]
+
+            # Check for queries ranking 1-5
+            if top_position_queries:
+                top_query_examples = sorted(top_position_queries, key=lambda x: x['impressions'], reverse=True)[:3]
+                query_names = ', '.join([f"'{q['query']}'" for q in top_query_examples])
+                keep_content_bullets.append(f"Top-ranking content (positions 1-5): {query_names}")
+
+            # Check for high-impression query clusters
+            high_impression_queries = [q for q in primary_queries if q['impressions'] >= 50]
+            if high_impression_queries:
+                total_high_imp = sum(q['impressions'] for q in high_impression_queries)
+                if primary_total_impressions > 0:
+                    share = total_high_imp / primary_total_impressions
+                    if share >= 0.20:
+                        keep_content_bullets.append(f"High-traffic sections ({share:.0%} of impressions)")
+
+            # Check for strong position queries (6-10)
+            if strong_position_queries:
+                keep_content_bullets.append(f"Content ranking positions 6-10 ({len(strong_position_queries)} queries)")
+
+        # Add word count context
+        if primary_word_count >= 1000:
+            keep_content_bullets.append(f"Comprehensive content ({primary_word_count:,} words)")
+        elif primary_word_count > 0:
+            keep_content_bullets.append(f"Existing content ({primary_word_count:,} words)")
+
+        if not keep_content_bullets:
+            keep_content_bullets.append("Primary page structure and core content")
+
+        keep_content = '\n'.join([f"• {b}" for b in keep_content_bullets])
+
+        # Generate one row per secondary URL
+        for secondary_url in secondary_urls:
+            # Get Secondary URL's queries
+            secondary_queries = url_queries.get(secondary_url, [])
+            secondary_word_count = url_word_counts.get(secondary_url, 0)
+
+            # Build "Move These Sections" for Secondary URL
+            move_sections_bullets = []
+
+            if secondary_queries:
+                # Find unique queries not covered by Primary
+                unique_queries = [
+                    q for q in secondary_queries
+                    if q['query'].lower() not in primary_query_set
+                ]
+
+                # Find queries where Secondary ranks better (>3 positions better)
+                better_ranking_queries = []
+                for sq in secondary_queries:
+                    sq_query_lower = sq['query'].lower()
+                    for pq in primary_queries:
+                        if pq['query'].lower() == sq_query_lower:
+                            if pq['position'] > 0 and sq['position'] > 0:
+                                if pq['position'] - sq['position'] > 3:
+                                    better_ranking_queries.append(sq)
+                            break
+
+                # Add unique query coverage
+                if unique_queries:
+                    unique_examples = sorted(unique_queries, key=lambda x: x['impressions'], reverse=True)[:3]
+                    unique_names = ', '.join([f"'{q['query']}'" for q in unique_examples])
+                    move_sections_bullets.append(f"Unique content not on Primary: {unique_names}")
+
+                # Add better-ranking content
+                if better_ranking_queries:
+                    better_examples = sorted(better_ranking_queries, key=lambda x: x['impressions'], reverse=True)[:2]
+                    better_names = ', '.join([f"'{q['query']}'" for q in better_examples])
+                    move_sections_bullets.append(f"Content ranking better than Primary: {better_names}")
+
+                # Check for high-value queries on Secondary
+                high_value_secondary = [q for q in secondary_queries if q['impressions'] >= 30]
+                if high_value_secondary and not move_sections_bullets:
+                    hv_examples = sorted(high_value_secondary, key=lambda x: x['impressions'], reverse=True)[:2]
+                    hv_names = ', '.join([f"'{q['query']}'" for q in hv_examples])
+                    move_sections_bullets.append(f"High-impression queries: {hv_names}")
+
+            # Check if Secondary has more content depth
+            if secondary_word_count > primary_word_count and secondary_word_count > 500:
+                diff = secondary_word_count - primary_word_count
+                move_sections_bullets.append(f"Additional content depth ({diff:,} more words) - review for valuable sections")
+
+            if not move_sections_bullets:
+                move_sections_bullets.append("Review page for any unique angles or examples to preserve")
+
+            move_sections = '\n'.join([f"• {b}" for b in move_sections_bullets])
+
+            # Generate reasoning for this specific merge
+            reasoning = (
+                f"Merging '{secondary_url}' into '{primary_url}' eliminates keyword cannibalization "
+                f"for the '{topic}' topic. Primary URL has stronger overall authority; "
+                f"Secondary URL's unique content should be integrated before redirect."
+            )
+
+            playbook_rows.append({
+                'Topic': topic,
+                'Primary URL': primary_url,
+                'Secondary URL': secondary_url,
+                'Keep This Content': keep_content,
+                'Move These Sections': move_sections,
+                'Retire This Page': 'Yes',
+                'Reasoning': reasoning
+            })
+
+    if not playbook_rows:
+        return pd.DataFrame(columns=empty_columns)
+
+    result_df = pd.DataFrame(playbook_rows)
+
+    logger.info(f"Generated {len(result_df)} merge playbook entries from {len(consolidations)} consolidation topics")
+
+    return result_df
+
+
 def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_threshold: int = 1000, gsc_df: Optional[pd.DataFrame] = None) -> None:
     """Write analytical insight sheets to workbook - API version."""
     from openpyxl.styles import Font, PatternFill
@@ -2190,6 +2408,54 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
 
     ws4.freeze_panes = 'A2'
     logger.info(f"Wrote Redirect & Merge Plan sheet: {len(redirect_df)} redirects")
+
+    # Sheet 5: Merge Playbooks (content-level merge instructions)
+    # Build url_word_counts for merge playbooks
+    url_word_counts = {}
+    if df is not None and len(df) > 0:
+        word_count_col = None
+        for col in ['word_count', 'Word Count', 'wordcount']:
+            if col in df.columns:
+                word_count_col = col
+                break
+
+        url_col = None
+        for col in ['url', 'URL', 'Address']:
+            if col in df.columns:
+                url_col = col
+                break
+
+        if word_count_col and url_col:
+            df_copy = df.copy()
+            df_copy[word_count_col] = pd.to_numeric(df_copy[word_count_col], errors='coerce').fillna(0)
+            url_word_counts = dict(zip(df_copy[url_col], df_copy[word_count_col]))
+
+    playbook_df = build_merge_playbooks_api(new_content_df, gsc_df, url_word_counts)
+    ws5 = workbook.create_sheet(title='Merge Playbooks')
+
+    if len(playbook_df) > 0:
+        for col_idx, col_name in enumerate(playbook_df.columns, start=1):
+            cell = ws5.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        for row_idx, row in enumerate(playbook_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws5.cell(row=row_idx, column=col_idx, value=value)
+
+        # Column widths for merge playbooks
+        ws5.column_dimensions['A'].width = 35  # Topic
+        ws5.column_dimensions['B'].width = 70  # Primary URL
+        ws5.column_dimensions['C'].width = 70  # Secondary URL
+        ws5.column_dimensions['D'].width = 60  # Keep This Content
+        ws5.column_dimensions['E'].width = 60  # Move These Sections
+        ws5.column_dimensions['F'].width = 18  # Retire This Page
+        ws5.column_dimensions['G'].width = 100  # Reasoning
+    else:
+        ws5.cell(row=1, column=1, value='No merge playbooks needed (no "Consolidate pages" actions found)')
+
+    ws5.freeze_panes = 'A2'
+    logger.info(f"Wrote Merge Playbooks sheet: {len(playbook_df)} entries")
 
 
 def create_excel_report(

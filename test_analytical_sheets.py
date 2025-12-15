@@ -2,10 +2,12 @@
 """
 Verification script for Analytical Insight sheets in WQA Generator output.
 
-This script verifies that the three analytical insight sheets are correctly created:
+This script verifies that the five analytical insight sheets are correctly created:
 - Content to Optimize
 - Thin Content Opportunities
 - New Content Opportunities
+- Redirect & Merge Plan
+- Merge Playbooks
 
 Usage:
     python test_analytical_sheets.py <path_to_wqa_output.xlsx>
@@ -376,6 +378,95 @@ def verify_analytical_sheets(excel_path: str) -> bool:
                 errors.append(f"  {sheet_name}: {primary_as_secondary} Primary URL(s) also appear as Secondary URL")
             else:
                 print(f"  [OK] No Primary URL appears as Secondary URL")
+
+    print()
+
+    # ==========================================================================
+    # Verify Sheet 5: Merge Playbooks
+    # ==========================================================================
+    sheet_name = 'Merge Playbooks'
+    print(f"Checking '{sheet_name}'...")
+
+    if sheet_name not in wb.sheetnames:
+        # Sheet may not exist if no consolidations were found
+        print(f"  [INFO] Sheet '{sheet_name}' not found (expected if no consolidations)")
+    else:
+        ws = wb[sheet_name]
+        print(f"  [OK] Sheet exists")
+
+        # Check for expected headers
+        expected_headers = [
+            'Topic', 'Primary URL', 'Secondary URL', 'Keep This Content',
+            'Move These Sections', 'Retire This Page', 'Reasoning'
+        ]
+
+        # Check if sheet has data or the "no playbooks" message
+        first_cell = ws.cell(row=1, column=1).value
+        if first_cell == 'No merge playbooks needed (no "Consolidate pages" actions found)':
+            print(f"  [OK] Sheet has 'no playbooks' message (no consolidations found)")
+        else:
+            # Check headers
+            for col_idx, expected in enumerate(expected_headers, start=1):
+                actual = ws.cell(row=1, column=col_idx).value
+                if actual != expected:
+                    errors.append(f"  {sheet_name}: Column {col_idx} header - expected '{expected}', got '{actual}'")
+                else:
+                    print(f"  [OK] Column {col_idx}: '{expected}'")
+
+            # Check freeze panes
+            if ws.freeze_panes != 'A2':
+                warnings.append(f"  {sheet_name}: Freeze panes expected 'A2', got '{ws.freeze_panes}'")
+            else:
+                print(f"  [OK] Freeze panes at A2")
+
+            # Count data rows
+            row_count = ws.max_row - 1  # Exclude header
+            print(f"  [OK] Data rows: {row_count}")
+
+            # ======================================================================
+            # Merge Playbooks Validation
+            # ======================================================================
+            print(f"  Validating Merge Playbooks...")
+
+            # Column indices (1-based)
+            retire_col = 6  # Retire This Page
+
+            non_yes_retire = 0
+            rows_without_keep = 0
+            rows_without_move = 0
+
+            for row_idx in range(2, ws.max_row + 1):
+                retire_value = ws.cell(row=row_idx, column=retire_col).value
+                keep_content = ws.cell(row=row_idx, column=4).value or ''
+                move_sections = ws.cell(row=row_idx, column=5).value or ''
+
+                # Check: Retire This Page is always "Yes"
+                if retire_value != 'Yes':
+                    non_yes_retire += 1
+
+                # Check: Keep This Content is not empty
+                if not keep_content.strip():
+                    rows_without_keep += 1
+
+                # Check: Move These Sections is not empty
+                if not move_sections.strip():
+                    rows_without_move += 1
+
+            # Report validation results
+            if non_yes_retire > 0:
+                errors.append(f"  {sheet_name}: {non_yes_retire} row(s) have 'Retire This Page' != 'Yes'")
+            else:
+                print(f"  [OK] All rows have 'Retire This Page' = 'Yes'")
+
+            if rows_without_keep > 0:
+                warnings.append(f"  {sheet_name}: {rows_without_keep} row(s) have empty 'Keep This Content'")
+            else:
+                print(f"  [OK] All rows have 'Keep This Content' populated")
+
+            if rows_without_move > 0:
+                warnings.append(f"  {sheet_name}: {rows_without_move} row(s) have empty 'Move These Sections'")
+            else:
+                print(f"  [OK] All rows have 'Move These Sections' populated")
 
     print()
 
