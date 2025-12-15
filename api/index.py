@@ -1741,11 +1741,12 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
         secondary_urls = ""
         reasoning = ""
 
-        # Check for strong dominant page that should be EXCLUDED entirely
+        # Track clusters with dominant pages for debugging (but DO NOT exclude them)
         if dominant_url and dominant_data:
-            logger.debug(f"Excluding topic '{cluster['primary_query']}' - dominant page {dominant_url} "
-                        f"has {dominant_data['share']:.0%} impressions at position {dominant_data['avg_position']:.1f}")
-            continue
+            logger.debug(f"[CLUSTER DEBUG] Topic '{cluster['primary_query']}' has dominant page {dominant_url} "
+                        f"({dominant_data['share']:.0%} impressions at position {dominant_data['avg_position']:.1f}) - evaluating for action")
+            # NOTE: Previously this would `continue` and exclude the cluster.
+            # Now we flow through to assign an appropriate action (usually Expand existing page)
 
         # DECISION LOGIC
         if num_urls == 0:
@@ -1790,7 +1791,7 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
         elif num_urls == 2:
             url1, url2 = url_analysis[0], url_analysis[1]
 
-            if url1['share'] < 0.80 and url2['share'] >= 0.15:
+            if url1['share'] < 0.65 and url2['share'] >= 0.10:
                 recommended_action = "Consolidate pages"
                 primary_url = url1['url']
                 secondary_urls = url2['url']
@@ -1804,7 +1805,7 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
         else:
             # 3+ URLs - Consolidation needed
             top_urls = url_analysis[:3]
-            meaningful_urls = [u for u in top_urls if u['share'] >= 0.10]
+            meaningful_urls = [u for u in top_urls if u['share'] >= 0.08]
 
             if len(meaningful_urls) >= 2:
                 recommended_action = "Consolidate pages"
@@ -2314,6 +2315,31 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
     header_font = Font(bold=True)
     header_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
 
+    # Debug instrumentation: Log GSC query data details before building analytical sheets
+    if gsc_df is not None and len(gsc_df) > 0:
+        logger.info(f"[ANALYTICAL DEBUG] GSC data received: {len(gsc_df)} rows")
+        logger.info(f"[ANALYTICAL DEBUG] Columns: {list(gsc_df.columns)}")
+        query_col = 'query' if 'query' in gsc_df.columns else ('primary_keyword' if 'primary_keyword' in gsc_df.columns else None)
+        url_col = 'url' if 'url' in gsc_df.columns else ('page' if 'page' in gsc_df.columns else None)
+        if query_col:
+            unique_queries = gsc_df[query_col].nunique() if query_col in gsc_df.columns else 0
+            logger.info(f"[ANALYTICAL DEBUG] Unique queries ({query_col}): {unique_queries}")
+        if url_col:
+            unique_pages = gsc_df[url_col].nunique() if url_col in gsc_df.columns else 0
+            logger.info(f"[ANALYTICAL DEBUG] Unique pages ({url_col}): {unique_pages}")
+        if 'impressions' in gsc_df.columns:
+            total_impressions = gsc_df['impressions'].sum()
+            qualifying = len(gsc_df[gsc_df['impressions'] >= 10])
+            logger.info(f"[ANALYTICAL DEBUG] Total impressions: {total_impressions:,.0f}, Qualifying rows (>=10 impr): {qualifying}")
+            if qualifying > 0:
+                top_queries = gsc_df.nlargest(5, 'impressions')
+                for _, row in top_queries.iterrows():
+                    q = row.get(query_col, 'N/A') if query_col else 'N/A'
+                    u = row.get(url_col, 'N/A') if url_col else 'N/A'
+                    logger.info(f"[ANALYTICAL DEBUG]   - '{q}' ({row.get('impressions', 0):,.0f} impr) -> {u[:60]}...")
+    else:
+        logger.warning(f"[ANALYTICAL DEBUG] GSC data is None or empty - topic clustering will not run")
+
     # Sheet 1: Content to Optimize
     content_df = build_content_to_optimize_api(df)
     ws1 = workbook.create_sheet(title='Content to Optimize')
@@ -2378,7 +2404,19 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
         ws3.column_dimensions['J'].width = 22  # Suggested Page Type
         ws3.column_dimensions['K'].width = 14  # Priority Score
     else:
-        ws3.cell(row=1, column=1, value='No new content opportunities found (GSC query data required)')
+        # Provide specific reason for empty New Content Opportunities
+        if gsc_df is None:
+            empty_reason = "GSC data not connected. Connect Google Search Console or upload a GSC CSV file with query-level data."
+        elif len(gsc_df) == 0:
+            empty_reason = "GSC returned 0 rows. The property may have no data yet, or the date range returned empty results."
+        elif 'query' not in gsc_df.columns and 'primary_keyword' not in gsc_df.columns:
+            empty_reason = "GSC data missing 'query' column. Ensure your GSC export includes query-level data, not just page-level aggregates."
+        elif 'impressions' in gsc_df.columns and len(gsc_df[gsc_df['impressions'] >= 10]) == 0:
+            empty_reason = "No queries with >=10 impressions found. Try a longer date range or check if the property has search traffic."
+        else:
+            empty_reason = "Topic clustering found no qualifying clusters. Check logs for details."
+        ws3.cell(row=1, column=1, value=empty_reason)
+        logger.warning(f"[NEW CONTENT] Empty result: {empty_reason}")
     ws3.freeze_panes = 'A2'
     logger.info(f"Wrote New Content Opportunities sheet: {len(new_content_df)} topics")
 
@@ -2404,7 +2442,16 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
         ws4.column_dimensions['E'].width = 14  # Redirect Type
         ws4.column_dimensions['F'].width = 100  # Reason
     else:
-        ws4.cell(row=1, column=1, value='No consolidation redirects needed (no "Consolidate pages" actions found)')
+        # Provide specific reason for empty Redirect & Merge Plan
+        if len(new_content_df) == 0:
+            redirect_empty_reason = "No topic clusters generated - see 'New Content Opportunities' sheet for details."
+        elif 'Recommended Action' not in new_content_df.columns:
+            redirect_empty_reason = "Topic data missing 'Recommended Action' column - clustering may have failed."
+        elif len(new_content_df[new_content_df['Recommended Action'] == 'Consolidate pages']) == 0:
+            redirect_empty_reason = "No 'Consolidate pages' actions found. All topics have single-page or expansion recommendations."
+        else:
+            redirect_empty_reason = "No consolidation redirects generated - check logs for details."
+        ws4.cell(row=1, column=1, value=redirect_empty_reason)
 
     ws4.freeze_panes = 'A2'
     logger.info(f"Wrote Redirect & Merge Plan sheet: {len(redirect_df)} redirects")
@@ -2452,7 +2499,14 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
         ws5.column_dimensions['F'].width = 18  # Retire This Page
         ws5.column_dimensions['G'].width = 100  # Reasoning
     else:
-        ws5.cell(row=1, column=1, value='No merge playbooks needed (no "Consolidate pages" actions found)')
+        # Provide specific reason for empty Merge Playbooks
+        if len(new_content_df) == 0:
+            playbook_empty_reason = "No topic clusters generated - see 'New Content Opportunities' sheet for details."
+        elif len(redirect_df) == 0:
+            playbook_empty_reason = "No consolidation actions found - see 'Redirect & Merge Plan' sheet for details."
+        else:
+            playbook_empty_reason = "Merge playbooks could not be generated from the consolidation data - check logs for details."
+        ws5.cell(row=1, column=1, value=playbook_empty_reason)
 
     ws5.freeze_panes = 'A2'
     logger.info(f"Wrote Merge Playbooks sheet: {len(playbook_df)} entries")
@@ -3064,6 +3118,77 @@ async def fetch_gsc_report(credentials: Credentials, site_url: str, days: int = 
     except Exception as e:
         logger.error(f"Error fetching GSC report: {e}")
         return pd.DataFrame(columns=['url', 'clicks', 'impressions', 'ctr', 'avg_position', 'primary_keyword'])
+
+
+async def fetch_gsc_query_data(credentials: Credentials, site_url: str, days: int = 90) -> pd.DataFrame:
+    """
+    Fetch GSC query-level data for topic clustering and content analysis.
+
+    Returns query+page level data needed for:
+    - New Content Opportunities (topic clustering)
+    - Redirect & Merge Plan (cannibalization detection)
+    - Merge Playbooks (consolidation recommendations)
+
+    Args:
+        credentials: Google OAuth credentials
+        site_url: GSC property URL (must match exactly, including protocol)
+        days: Number of days to fetch (default 90)
+
+    Returns:
+        DataFrame with columns: query, url, clicks, impressions, ctr, avg_position
+    """
+    empty_df = pd.DataFrame(columns=['query', 'url', 'clicks', 'impressions', 'ctr', 'avg_position'])
+
+    try:
+        service = build('searchconsole', 'v1', credentials=credentials)
+
+        end_date = datetime.now() - timedelta(days=3)  # GSC data has ~3 day lag
+        start_date = end_date - timedelta(days=days)
+
+        # Fetch query+page level data (required for topic clustering)
+        request_body = {
+            'startDate': start_date.strftime('%Y-%m-%d'),
+            'endDate': end_date.strftime('%Y-%m-%d'),
+            'dimensions': ['query', 'page'],  # Critical: query first, then page
+            'rowLimit': 25000
+        }
+
+        logger.info(f"[GSC QUERY] Fetching query+page data for {site_url} ({days} days)")
+        response = service.searchanalytics().query(
+            siteUrl=site_url,
+            body=request_body
+        ).execute()
+
+        rows = []
+        for row in response.get('rows', []):
+            keys = row.get('keys', [])
+            if len(keys) >= 2:
+                rows.append({
+                    'query': keys[0],
+                    'url': keys[1],
+                    'clicks': row.get('clicks', 0),
+                    'impressions': row.get('impressions', 0),
+                    'ctr': row.get('ctr', 0),
+                    'avg_position': row.get('position', 0)
+                })
+
+        if rows:
+            df = pd.DataFrame(rows)
+            unique_queries = df['query'].nunique()
+            unique_pages = df['url'].nunique()
+            total_impressions = df['impressions'].sum()
+            logger.info(f"[GSC QUERY] Fetched {len(df)} query+page rows: "
+                       f"{unique_queries} unique queries, {unique_pages} unique pages, "
+                       f"{total_impressions:,.0f} total impressions")
+            return df
+        else:
+            logger.warning(f"[GSC QUERY] No query+page data returned for {site_url} "
+                          f"(date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')})")
+            return empty_df
+
+    except Exception as e:
+        logger.error(f"[GSC QUERY] Error fetching query data: {e}")
+        return empty_df
 
 
 # =============================================================================
@@ -3831,18 +3956,29 @@ async def generate_report(
                 logger.info(f"Loaded GA4 data from file: {len(ga_df)} rows")
 
         # Get GSC data - either from API or file
+        # gsc_df: page-level data for URL merging
+        # gsc_query_df: query+page level data for topic clustering/analytical sheets
         gsc_df = None
+        gsc_query_df = None
         if use_gsc_api == "true" and gsc_site_url and google_tokens:
             tokens = decrypt_token(google_tokens)
             if tokens:
                 credentials = get_credentials_from_tokens(tokens)
+                # Fetch page-level data for URL merging
                 gsc_df = await fetch_gsc_report(credentials, gsc_site_url)
-                logger.info(f"Loaded GSC data from API: {len(gsc_df)} rows")
+                logger.info(f"Loaded GSC page-level data from API: {len(gsc_df)} rows")
+                # Fetch query-level data for topic clustering
+                gsc_query_df = await fetch_gsc_query_data(credentials, gsc_site_url)
+                logger.info(f"Loaded GSC query-level data from API: {len(gsc_query_df)} rows")
         elif gsc_file and gsc_file.filename:
             gsc_content = await gsc_file.read()
             if gsc_content:
                 gsc_df = load_gsc_data(gsc_content, gsc_file.filename or "")
                 logger.info(f"Loaded GSC data from file: {len(gsc_df)} rows")
+                # File uploads with 'query' column can be used directly for topic clustering
+                if 'query' in gsc_df.columns or 'primary_keyword' in gsc_df.columns:
+                    gsc_query_df = gsc_df.copy()
+                    logger.info(f"Using GSC file data for topic clustering: {len(gsc_query_df)} rows")
 
         backlink_df = None
         if backlink_file and backlink_file.filename:
@@ -3905,7 +4041,8 @@ async def generate_report(
             logger.warning(f"ATTENTION: {high_issues} high-severity data quality issues found!")
 
         # Create Excel report with data quality sheet
-        excel_bytes = create_excel_report(df, summaries, quality_report)
+        # Pass gsc_query_df for topic clustering in analytical sheets
+        excel_bytes = create_excel_report(df, summaries, quality_report, gsc_query_df)
 
         return StreamingResponse(
             io.BytesIO(excel_bytes),

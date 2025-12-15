@@ -834,12 +834,204 @@ def verify_empty_sheet_regression(excel_path: str, gsc_path: str = None) -> bool
         return True
 
 
+def run_api_query_data_test() -> bool:
+    """
+    Test the API path for GSC query data flow.
+
+    This test verifies that:
+    1. Query-level GSC data flows correctly to write_analytical_sheets_api
+    2. New Content Opportunities populates with topic clusters
+    3. Consolidation actions trigger Redirect & Merge Plan entries
+    4. Merge Playbooks populate when consolidations exist
+
+    Returns:
+        True if all tests pass, False otherwise
+    """
+    import pandas as pd
+    import io
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent / 'api'))
+
+    try:
+        from api.index import (
+            build_new_content_opportunities_api,
+            build_redirect_merge_plan_api,
+            build_merge_playbooks_api,
+            write_analytical_sheets_api
+        )
+        from openpyxl import Workbook
+    except ImportError as e:
+        print(f"ERROR: Could not import API modules: {e}")
+        return False
+
+    print("=" * 60)
+    print("API PATH TEST: GSC Query Data Flow")
+    print("=" * 60)
+    print()
+
+    errors = []
+    tests_passed = 0
+    tests_total = 0
+
+    # Create synthetic query-level GSC data (the format returned by fetch_gsc_query_data)
+    gsc_query_data = pd.DataFrame([
+        # Topic 1: "best hvac company" - two pages competing (should trigger consolidation)
+        {'query': 'best hvac company atlanta', 'url': 'https://example.com/hvac-services', 'impressions': 800, 'clicks': 40, 'avg_position': 5},
+        {'query': 'top hvac contractors atlanta', 'url': 'https://example.com/hvac-services', 'impressions': 600, 'clicks': 30, 'avg_position': 6},
+        {'query': 'atlanta hvac repair', 'url': 'https://example.com/hvac-repair', 'impressions': 500, 'clicks': 25, 'avg_position': 7},
+        {'query': 'hvac service near me atlanta', 'url': 'https://example.com/hvac-repair', 'impressions': 400, 'clicks': 20, 'avg_position': 8},
+
+        # Topic 2: "plumbing services" - one dominant page (should trigger expand)
+        {'query': 'plumbing services atlanta', 'url': 'https://example.com/plumbing', 'impressions': 1200, 'clicks': 60, 'avg_position': 4},
+        {'query': 'atlanta plumbers', 'url': 'https://example.com/plumbing', 'impressions': 900, 'clicks': 45, 'avg_position': 5},
+        {'query': 'emergency plumber atlanta', 'url': 'https://example.com/plumbing', 'impressions': 700, 'clicks': 35, 'avg_position': 6},
+
+        # Topic 3: "new construction" - no current coverage (should trigger create)
+        {'query': 'new construction home builder', 'url': '', 'impressions': 500, 'clicks': 15, 'avg_position': 25},
+        {'query': 'custom home builder atlanta', 'url': '', 'impressions': 400, 'clicks': 10, 'avg_position': 28},
+    ])
+
+    # Create mock URL-level DataFrame (for thin content detection)
+    # Must include all columns that write_analytical_sheets_api expects
+    df = pd.DataFrame([
+        {'url': 'https://example.com/hvac-services', 'word_count': 1500, 'sessions': 100, 'status_code': 200,
+         'indexable': True, 'impressions': 1400, 'clicks': 70, 'ctr': 0.05, 'avg_position': 5.5,
+         'meta_description': 'HVAC services in Atlanta', 'page_type': 'Service Page', 'page_title': 'HVAC Services'},
+        {'url': 'https://example.com/hvac-repair', 'word_count': 1200, 'sessions': 80, 'status_code': 200,
+         'indexable': True, 'impressions': 900, 'clicks': 45, 'ctr': 0.05, 'avg_position': 7.5,
+         'meta_description': 'HVAC repair experts', 'page_type': 'Service Page', 'page_title': 'HVAC Repair'},
+        {'url': 'https://example.com/plumbing', 'word_count': 2000, 'sessions': 150, 'status_code': 200,
+         'indexable': True, 'impressions': 2800, 'clicks': 140, 'ctr': 0.05, 'avg_position': 5.0,
+         'meta_description': 'Plumbing services Atlanta', 'page_type': 'Service Page', 'page_title': 'Plumbing Services'},
+    ])
+
+    # =========================================================================
+    # Test 1: build_new_content_opportunities_api produces results
+    # =========================================================================
+    tests_total += 1
+    print("Test 1: API build_new_content_opportunities_api produces results...")
+
+    new_content_df = build_new_content_opportunities_api(df, gsc_query_data, thin_threshold=1000)
+
+    if len(new_content_df) == 0:
+        errors.append("Test 1 FAILED: build_new_content_opportunities_api returned empty DataFrame")
+    else:
+        # Check all required columns exist
+        required_cols = ['Suggested Topic', 'Primary Keyword', 'Recommended Action', 'Primary URL', 'Secondary URLs', 'Reasoning']
+        missing_cols = [col for col in required_cols if col not in new_content_df.columns]
+        if missing_cols:
+            errors.append(f"Test 1 FAILED: Missing columns: {missing_cols}")
+        else:
+            actions = new_content_df['Recommended Action'].value_counts().to_dict()
+            print(f"  [OK] Produced {len(new_content_df)} topics: {actions}")
+            tests_passed += 1
+
+    # =========================================================================
+    # Test 2: Consolidation action exists for competing URLs
+    # =========================================================================
+    tests_total += 1
+    print("Test 2: Consolidation action exists for competing URLs...")
+
+    consolidate_count = len(new_content_df[new_content_df['Recommended Action'] == 'Consolidate pages']) if len(new_content_df) > 0 else 0
+
+    if consolidate_count == 0:
+        errors.append("Test 2 FAILED: No 'Consolidate pages' actions found despite competing URLs in data")
+    else:
+        print(f"  [OK] Found {consolidate_count} 'Consolidate pages' action(s)")
+        tests_passed += 1
+
+    # =========================================================================
+    # Test 3: Redirect & Merge Plan populates from consolidations
+    # =========================================================================
+    tests_total += 1
+    print("Test 3: Redirect & Merge Plan populates from consolidations...")
+
+    redirect_df = build_redirect_merge_plan_api(new_content_df)
+
+    if consolidate_count > 0 and len(redirect_df) == 0:
+        errors.append("Test 3 FAILED: Consolidation actions exist but Redirect & Merge Plan is empty")
+    elif consolidate_count == 0:
+        print(f"  [SKIP] No consolidations to test")
+    else:
+        print(f"  [OK] Redirect & Merge Plan has {len(redirect_df)} entries")
+        tests_passed += 1
+
+    # =========================================================================
+    # Test 4: Merge Playbooks populates from consolidations
+    # =========================================================================
+    tests_total += 1
+    print("Test 4: Merge Playbooks populates from consolidations...")
+
+    url_word_counts = dict(zip(df['url'], df['word_count']))
+    playbook_df = build_merge_playbooks_api(new_content_df, gsc_query_data, url_word_counts)
+
+    if consolidate_count > 0 and len(playbook_df) == 0:
+        errors.append("Test 4 FAILED: Consolidation actions exist but Merge Playbooks is empty")
+    elif consolidate_count == 0:
+        print(f"  [SKIP] No consolidations to test")
+    else:
+        print(f"  [OK] Merge Playbooks has {len(playbook_df)} entries")
+        tests_passed += 1
+
+    # =========================================================================
+    # Test 5: Full write_analytical_sheets_api integration
+    # =========================================================================
+    tests_total += 1
+    print("Test 5: Full write_analytical_sheets_api integration...")
+
+    try:
+        workbook = Workbook()
+        write_analytical_sheets_api(workbook, df, thin_content_threshold=1000, gsc_df=gsc_query_data)
+
+        # Check sheet names exist
+        expected_sheets = ['New Content Opportunities', 'Redirect & Merge Plan', 'Merge Playbooks']
+        for sheet_name in expected_sheets:
+            if sheet_name not in workbook.sheetnames:
+                errors.append(f"Test 5 FAILED: Missing sheet '{sheet_name}'")
+
+        if all(s in workbook.sheetnames for s in expected_sheets):
+            # Check New Content Opportunities has data
+            ws = workbook['New Content Opportunities']
+            first_cell = ws.cell(row=1, column=1).value
+            if 'GSC data not connected' in str(first_cell) or 'GSC returned 0 rows' in str(first_cell):
+                errors.append(f"Test 5 FAILED: New Content Opportunities shows empty message: {first_cell}")
+            else:
+                row_count = ws.max_row - 1  # Exclude header
+                if row_count > 0:
+                    print(f"  [OK] write_analytical_sheets_api created sheets with {row_count} content opportunities")
+                    tests_passed += 1
+                else:
+                    errors.append("Test 5 FAILED: New Content Opportunities has 0 data rows")
+    except Exception as e:
+        errors.append(f"Test 5 FAILED: Exception during write_analytical_sheets_api: {e}")
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    print()
+    print("=" * 60)
+    print(f"API PATH TEST RESULTS: {tests_passed}/{tests_total} tests passed")
+    print("=" * 60)
+
+    if errors:
+        print()
+        print("ERRORS:")
+        for error in errors:
+            print(f"  [FAIL] {error}")
+        return False
+    else:
+        print("[OK] All API path tests passed!")
+        return True
+
+
 def main():
     """Main entry point."""
     # Check for --unit-test flag
     if '--unit-test' in sys.argv:
-        success = run_clustering_unit_tests()
-        sys.exit(0 if success else 1)
+        cli_success = run_clustering_unit_tests()
+        print()
+        api_success = run_api_query_data_test()
+        sys.exit(0 if (cli_success and api_success) else 1)
 
     if len(sys.argv) < 2:
         print("Usage: python test_analytical_sheets.py <path_to_wqa_output.xlsx> [--gsc <gsc_file.csv>]")
