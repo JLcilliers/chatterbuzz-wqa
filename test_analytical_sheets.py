@@ -157,12 +157,15 @@ def verify_analytical_sheets(excel_path: str) -> bool:
         ws = wb[sheet_name]
         print(f"  [OK] Sheet exists")
 
-        # Check for expected headers (topic-based, not URL-based)
-        # Note: Cannibalization Risk column added between Avg Position and Why This Content Is Needed
+        # Check for expected headers with Content Action Recommendation columns
         expected_headers = [
             'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
-            'Avg Position', 'Cannibalization Risk', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
+            'Avg Position', 'Recommended Action', 'Primary URL', 'Secondary URLs', 'Reasoning',
+            'Suggested Page Type', 'Priority Score'
         ]
+
+        # Valid action values
+        valid_actions = ['Create new page', 'Expand existing page', 'Consolidate pages']
 
         # Check if sheet has data or the "no opportunities" message
         first_cell = ws.cell(row=1, column=1).value
@@ -193,11 +196,74 @@ def verify_analytical_sheets(excel_path: str) -> bool:
             else:
                 print(f"  [OK] Row count within Top 20 cap")
 
-            # Verify no URL column exists (should be topic-based, not URL-based)
-            for col_idx in range(1, ws.max_column + 1):
-                header = ws.cell(row=1, column=col_idx).value
-                if header and 'URL' in str(header).upper():
-                    errors.append(f"  {sheet_name}: Found URL column '{header}' - sheet should be topic-based, not URL-based")
+            # ======================================================================
+            # Content Action Recommendation Validation
+            # ======================================================================
+            print(f"  Validating Content Action Recommendations...")
+
+            # Column indices (1-based)
+            action_col = 6      # Recommended Action
+            primary_url_col = 7  # Primary URL
+            secondary_urls_col = 8  # Secondary URLs
+
+            action_counts = {'Create new page': 0, 'Expand existing page': 0, 'Consolidate pages': 0}
+            rows_without_action = 0
+            invalid_actions = []
+            create_with_url = 0
+            consolidate_without_multiple = 0
+
+            for row_idx in range(2, ws.max_row + 1):
+                action = ws.cell(row=row_idx, column=action_col).value
+                primary_url = ws.cell(row=row_idx, column=primary_url_col).value or ''
+                secondary_urls = ws.cell(row=row_idx, column=secondary_urls_col).value or ''
+
+                # Check each topic has exactly one recommendation
+                if not action:
+                    rows_without_action += 1
+                elif action not in valid_actions:
+                    invalid_actions.append(f"Row {row_idx}: '{action}'")
+                else:
+                    action_counts[action] += 1
+
+                    # "Create new page" rows should have empty Primary URL
+                    if action == 'Create new page':
+                        if primary_url.strip():
+                            create_with_url += 1
+
+                    # "Consolidate pages" rows should list >= 2 URLs in Secondary URLs
+                    if action == 'Consolidate pages':
+                        url_count = len([u for u in secondary_urls.split(',') if u.strip()]) if secondary_urls else 0
+                        if url_count < 2:
+                            consolidate_without_multiple += 1
+
+            # Report action distribution
+            total_actions = sum(action_counts.values())
+            print(f"    Actions: Create={action_counts['Create new page']}, Expand={action_counts['Expand existing page']}, Consolidate={action_counts['Consolidate pages']}")
+
+            # Validate: every topic has exactly one recommendation
+            if rows_without_action > 0:
+                errors.append(f"  {sheet_name}: {rows_without_action} row(s) missing Recommended Action")
+            else:
+                print(f"  [OK] Every topic has a Recommended Action")
+
+            # Validate: all actions are valid
+            if invalid_actions:
+                for inv in invalid_actions[:5]:  # Show first 5
+                    errors.append(f"  {sheet_name}: Invalid action - {inv}")
+            else:
+                print(f"  [OK] All actions are valid values")
+
+            # Validate: "Create new page" rows have no Primary URL
+            if create_with_url > 0:
+                errors.append(f"  {sheet_name}: {create_with_url} 'Create new page' row(s) have Primary URL (should be empty)")
+            elif action_counts['Create new page'] > 0:
+                print(f"  [OK] 'Create new page' rows have empty Primary URL")
+
+            # Validate: "Consolidate pages" rows list >= 2 URLs
+            if consolidate_without_multiple > 0:
+                errors.append(f"  {sheet_name}: {consolidate_without_multiple} 'Consolidate pages' row(s) have < 2 Secondary URLs")
+            elif action_counts['Consolidate pages'] > 0:
+                print(f"  [OK] 'Consolidate pages' rows list >= 2 Secondary URLs")
 
     print()
 

@@ -1591,13 +1591,15 @@ def build_thin_content_api(df: pd.DataFrame, thin_threshold: int = 1000) -> pd.D
     })
 
 
-def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 20, thin_urls: set = None) -> pd.DataFrame:
+def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 20, thin_urls: set = None, url_word_counts: dict = None) -> pd.DataFrame:
     """
     Cluster similar queries into topic groups for new content opportunities.
-    API version - uses word-overlap algorithm with cannibalization detection.
+    API version - uses word-overlap algorithm with Content Action Recommendations.
 
-    Implements cannibalization detection to exclude topics where a strong
-    existing page already dominates (>=60% impressions AND avg position <=15).
+    Implements Create/Expand/Consolidate decision logic:
+    - Create new page: No dominant page, content gap exists
+    - Expand existing page: One page ranks but needs depth/optimization
+    - Consolidate pages: Multiple pages cannibalize each other
     """
     import re
     import math
@@ -1608,6 +1610,9 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
 
     if thin_urls is None:
         thin_urls = set()
+
+    if url_word_counts is None:
+        url_word_counts = {}
 
     def tokenize(query):
         query = str(query).lower().strip()
@@ -1692,65 +1697,139 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
             avg_position = 0
 
         # =====================================================================
-        # CANNIBALIZATION DETECTION
+        # URL-LEVEL METRICS ANALYSIS
         # =====================================================================
         url_metrics = cluster['urls']
         num_urls = len(url_metrics)
+
+        # Calculate per-URL metrics with CTR
+        url_analysis = []
+        for url, metrics in url_metrics.items():
+            url_impressions = metrics['impressions']
+            url_clicks = metrics['clicks']
+            url_positions = metrics['positions']
+            url_avg_pos = sum(url_positions) / len(url_positions) if url_positions else 0
+            url_ctr = (url_clicks / url_impressions * 100) if url_impressions > 0 else 0
+            url_share = url_impressions / cluster['total_impressions'] if cluster['total_impressions'] > 0 else 0
+            url_word_count = url_word_counts.get(url, 0)
+            is_thin = url in thin_urls or url_word_count < 1000
+
+            url_analysis.append({
+                'url': url, 'impressions': url_impressions, 'clicks': url_clicks,
+                'avg_position': url_avg_pos, 'ctr': url_ctr, 'share': url_share,
+                'word_count': url_word_count, 'is_thin': is_thin
+            })
+
+        # Sort by impressions (strongest first)
+        url_analysis.sort(key=lambda x: x['impressions'], reverse=True)
+
+        # Identify dominant page (if any)
         dominant_url = None
-        dominant_share = 0
-        dominant_position = None
-        cannibalization_risk = "No"
-        cannibalization_reason = ""
+        dominant_data = None
+        if url_analysis:
+            top_url = url_analysis[0]
+            if top_url['share'] >= 0.60 and top_url['avg_position'] <= 15:
+                if not top_url['is_thin']:
+                    dominant_url = top_url['url']
+                    dominant_data = top_url
 
-        if cluster['total_impressions'] > 0 and num_urls > 0:
-            # Calculate impression share per URL
-            for url, metrics in url_metrics.items():
-                url_share = metrics['impressions'] / cluster['total_impressions']
-                if url_share > dominant_share:
-                    dominant_share = url_share
-                    dominant_url = url
-                    if metrics['positions']:
-                        dominant_position = sum(metrics['positions']) / len(metrics['positions'])
+        # =====================================================================
+        # CONTENT ACTION RECOMMENDATION LOGIC
+        # =====================================================================
+        recommended_action = ""
+        primary_url = ""
+        secondary_urls = ""
+        reasoning = ""
 
-            # Check if dominant page meets exclusion criteria:
-            # >= 60% impressions AND avg position <= 15 AND not thin content
-            if dominant_url and dominant_share >= 0.60 and dominant_position is not None:
-                if dominant_position <= 15 and dominant_url not in thin_urls:
-                    # This topic has a strong existing page - EXCLUDE from new content
-                    logger.debug(f"Excluding topic '{cluster['primary_query']}' - dominant page has "
-                                f"{dominant_share:.0%} impressions at position {dominant_position:.1f}")
-                    continue  # Skip this cluster entirely
-                elif dominant_position <= 15 and dominant_url in thin_urls:
-                    # Dominant page exists but is thin - flag as cannibalization risk
-                    cannibalization_risk = "Yes"
-                    cannibalization_reason = f"Thin page {dominant_url[:50]}... ranks at position {dominant_position:.0f} with {dominant_share:.0%} impressions - consider expanding vs. new page"
+        # Check for strong dominant page that should be EXCLUDED entirely
+        if dominant_url and dominant_data:
+            logger.debug(f"Excluding topic '{cluster['primary_query']}' - dominant page {dominant_url} "
+                        f"has {dominant_data['share']:.0%} impressions at position {dominant_data['avg_position']:.1f}")
+            continue
 
-        # Check for split traffic cannibalization risk
-        if num_urls > 2 and not cannibalization_risk.startswith("Yes"):
-            cannibalization_risk = "Yes"
-            cannibalization_reason = f"Traffic split across {num_urls} URLs - consolidate existing pages or create authoritative hub"
-
-        primary_query = cluster['primary_query']
-
-        reasons = []
+        # DECISION LOGIC
         if num_urls == 0:
-            reasons.append("no landing page exists for these queries")
-        elif num_urls > 2:
-            reasons.append("traffic is split across multiple pages (consolidation needed)")
-        if avg_position > 15:
-            reasons.append(f"current ranking is weak (avg position {avg_position:.0f})")
-        if cluster['total_impressions'] >= 100 and cluster['total_clicks'] < 10:
-            reasons.append("high impressions but very few clicks (intent mismatch)")
-        if not reasons:
-            reasons.append("search demand without dedicated content")
+            recommended_action = "Create new page"
+            primary_url = ""
+            secondary_urls = ""
+            reasoning = f"Search demand exists ({cluster['total_impressions']:,} impressions) but no landing page currently serves these queries. This is a true content gap."
 
-        why_needed = f"These queries receive {cluster['total_impressions']:,} impressions but {'; '.join(reasons)}, indicating an opportunity for new content."
+        elif num_urls == 1:
+            single_url = url_analysis[0]
 
+            if single_url['avg_position'] > 20:
+                recommended_action = "Create new page"
+                primary_url = ""
+                secondary_urls = ""
+                reasoning = f"Existing page ({single_url['url'][:60]}...) ranks poorly at position {single_url['avg_position']:.0f}. A dedicated, well-optimized page would better serve this topic."
+
+            elif single_url['is_thin']:
+                recommended_action = "Expand existing page"
+                primary_url = single_url['url']
+                secondary_urls = ""
+                reasoning = f"Page exists but has thin content ({single_url['word_count']} words). Expanding with comprehensive content at position {single_url['avg_position']:.0f} can capture more traffic."
+
+            elif single_url['ctr'] < 2.0 and single_url['impressions'] >= 100:
+                recommended_action = "Expand existing page"
+                primary_url = single_url['url']
+                secondary_urls = ""
+                reasoning = f"Page ranks at position {single_url['avg_position']:.0f} with high impressions ({single_url['impressions']:,}) but very low CTR ({single_url['ctr']:.1f}%). Improve content depth and meta data to boost clicks."
+
+            elif single_url['avg_position'] > 10:
+                recommended_action = "Expand existing page"
+                primary_url = single_url['url']
+                secondary_urls = ""
+                reasoning = f"Page ranks at position {single_url['avg_position']:.0f} but not in top 10. Expanding content depth can improve rankings and capture more traffic."
+
+            else:
+                recommended_action = "Expand existing page"
+                primary_url = single_url['url']
+                secondary_urls = ""
+                reasoning = f"Page ranks at position {single_url['avg_position']:.0f} but doesn't fully capture the topic. Expanding with related subtopics can increase topical authority."
+
+        elif num_urls == 2:
+            url1, url2 = url_analysis[0], url_analysis[1]
+
+            if url1['share'] < 0.80 and url2['share'] >= 0.15:
+                recommended_action = "Consolidate pages"
+                primary_url = url1['url']
+                secondary_urls = url2['url']
+                reasoning = f"Two pages are competing for the same keywords, diluting rankings. {url1['url'][:50]}... has {url1['share']:.0%} impressions at position {url1['avg_position']:.0f}; {url2['url'][:50]}... has {url2['share']:.0%}. Consolidate into one authoritative page."
+            else:
+                recommended_action = "Expand existing page"
+                primary_url = url1['url']
+                secondary_urls = ""
+                reasoning = f"One page ({url1['url'][:50]}...) receives most impressions ({url1['share']:.0%}) at position {url1['avg_position']:.0f}. Expand this page to fully own the topic."
+
+        else:
+            # 3+ URLs - Consolidation needed
+            top_urls = url_analysis[:3]
+            meaningful_urls = [u for u in top_urls if u['share'] >= 0.10]
+
+            if len(meaningful_urls) >= 2:
+                recommended_action = "Consolidate pages"
+                primary_url = meaningful_urls[0]['url']
+                secondary_urls = ', '.join([u['url'] for u in meaningful_urls[1:]])
+                url_summary = '; '.join([f"{u['url'][:40]}... ({u['share']:.0%})" for u in meaningful_urls])
+                reasoning = f"Traffic is fragmented across {num_urls} pages causing keyword cannibalization. Top competing pages: {url_summary}. Consolidate into one authoritative hub."
+            elif url_analysis[0]['avg_position'] > 20:
+                recommended_action = "Create new page"
+                primary_url = ""
+                secondary_urls = ""
+                reasoning = f"Traffic is split across {num_urls} weak pages (best position: {url_analysis[0]['avg_position']:.0f}). Creating a dedicated, comprehensive page would better serve this topic than consolidating poor performers."
+            else:
+                recommended_action = "Expand existing page"
+                primary_url = url_analysis[0]['url']
+                secondary_urls = ""
+                reasoning = f"Multiple pages exist but {url_analysis[0]['url'][:50]}... leads with {url_analysis[0]['share']:.0%} impressions. Expand this page to consolidate authority."
+
+        # Generate suggested topic and page type
+        primary_query = cluster['primary_query']
         common_tokens = sorted(cluster['all_tokens'], key=lambda t: sum(1 for q in cluster['queries'] if t in q['tokens']), reverse=True)
         suggested_topic = ' '.join(common_tokens[:4]).title() if common_tokens else primary_query.title()
 
         query_lower = primary_query.lower()
-        intent_value = 0.5  # Default intent value
+        intent_value = 0.5
         if any(word in query_lower for word in ['how to', 'guide', 'tutorial', 'tips', 'steps']):
             page_type = 'Guide / How-To'
             intent_value = 0.7
@@ -1776,26 +1855,22 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
         secondary = [q['query'] for q in cluster['queries'] if q['query'] != primary_query][:8]
 
         # =====================================================================
-        # PRIORITY SCORE CALCULATION (New Weighting)
-        # 40% Impressions, 25% Lack of dominant URL, 20% Position weakness, 15% Intent value
+        # PRIORITY SCORE CALCULATION
+        # 40% Impressions, 25% Action urgency, 20% Position weakness, 15% Intent value
         # =====================================================================
-
-        # Impressions score (40% weight) - normalized 0-10 scale
         impressions_score = min(10, math.log10(max(1, cluster['total_impressions'])) * 2.5)
 
-        # Lack of dominant URL score (25% weight) - 0-10 scale
-        if num_urls == 0:
-            lack_dominant_score = 10  # No pages at all - perfect for new content
-        elif dominant_share < 0.40:
-            lack_dominant_score = 8  # Traffic highly fragmented
-        elif dominant_share < 0.60:
-            lack_dominant_score = 5  # Moderate fragmentation
-        else:
-            lack_dominant_score = 2  # One page is dominant but weak
+        # Action urgency score (25% weight)
+        if recommended_action == "Create new page":
+            action_urgency_score = 10 if num_urls == 0 else 7
+        elif recommended_action == "Consolidate pages":
+            action_urgency_score = 9  # High urgency - cannibalization hurts rankings
+        else:  # Expand
+            action_urgency_score = 5  # Lower urgency - existing page works somewhat
 
-        # Position weakness score (20% weight) - 0-10 scale
+        # Position weakness score (20% weight)
         if avg_position == 0 or num_urls == 0:
-            position_score = 10  # Not ranking at all
+            position_score = 10
         elif avg_position > 30:
             position_score = 9
         elif avg_position > 20:
@@ -1807,13 +1882,11 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
         else:
             position_score = 1
 
-        # Intent value score (15% weight)
         intent_score = intent_value * 10
 
-        # Calculate weighted priority score (0-10 scale)
         priority_score = round(
             (impressions_score * 0.40) +
-            (lack_dominant_score * 0.25) +
+            (action_urgency_score * 0.25) +
             (position_score * 0.20) +
             (intent_score * 0.15),
             1
@@ -1825,8 +1898,10 @@ def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 
             'Secondary Keywords': ', '.join(secondary) if secondary else '',
             'Total Impressions': cluster['total_impressions'],
             'Avg Position': round(avg_position, 1) if avg_position > 0 else 'N/A',
-            'Cannibalization Risk': cannibalization_risk,
-            'Why This Content Is Needed': why_needed if not cannibalization_reason else f"{why_needed} NOTE: {cannibalization_reason}",
+            'Recommended Action': recommended_action,
+            'Primary URL': primary_url,
+            'Secondary URLs': secondary_urls,
+            'Reasoning': reasoning,
             'Suggested Page Type': page_type,
             'Priority Score': priority_score
         })
@@ -1849,14 +1924,16 @@ def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.Da
     """
     empty_columns = [
         'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
-        'Avg Position', 'Cannibalization Risk', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
+        'Avg Position', 'Recommended Action', 'Primary URL', 'Secondary URLs', 'Reasoning',
+        'Suggested Page Type', 'Priority Score'
     ]
 
     if gsc_df is None or len(gsc_df) == 0:
         return pd.DataFrame(columns=empty_columns)
 
-    # Build set of thin content URLs for cannibalization checks
+    # Build set of thin content URLs and url_word_counts dict for Content Action logic
     thin_urls = set()
+    url_word_counts = {}
     if df is not None and len(df) > 0:
         word_count_col = None
         for col in ['word_count', 'Word Count', 'wordcount']:
@@ -1874,7 +1951,8 @@ def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.Da
             df_copy = df.copy()
             df_copy[word_count_col] = pd.to_numeric(df_copy[word_count_col], errors='coerce').fillna(0)
             thin_urls = set(df_copy[df_copy[word_count_col] < thin_threshold][url_col].tolist())
-            logger.debug(f"Identified {len(thin_urls)} thin content URLs for cannibalization checks")
+            url_word_counts = dict(zip(df_copy[url_col], df_copy[word_count_col]))
+            logger.debug(f"Identified {len(thin_urls)} thin content URLs and {len(url_word_counts)} URL word counts")
 
     gsc_copy = gsc_df.copy()
 
@@ -1916,7 +1994,7 @@ def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.Da
     if len(qualifying_queries) == 0:
         return pd.DataFrame(columns=empty_columns)
 
-    result = cluster_queries_into_topics_api(qualifying_queries, max_topics=20, thin_urls=thin_urls)
+    result = cluster_queries_into_topics_api(qualifying_queries, max_topics=20, thin_urls=thin_urls, url_word_counts=url_word_counts)
 
     if len(result) == 0:
         return pd.DataFrame(columns=empty_columns)
@@ -1988,10 +2066,12 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
         ws3.column_dimensions['C'].width = 60  # Secondary Keywords
         ws3.column_dimensions['D'].width = 16  # Total Impressions
         ws3.column_dimensions['E'].width = 12  # Avg Position
-        ws3.column_dimensions['F'].width = 20  # Cannibalization Risk
-        ws3.column_dimensions['G'].width = 80  # Why This Content Is Needed (includes cannibalization notes)
-        ws3.column_dimensions['H'].width = 22  # Suggested Page Type
-        ws3.column_dimensions['I'].width = 14  # Priority Score
+        ws3.column_dimensions['F'].width = 22  # Recommended Action
+        ws3.column_dimensions['G'].width = 60  # Primary URL
+        ws3.column_dimensions['H'].width = 80  # Secondary URLs
+        ws3.column_dimensions['I'].width = 100  # Reasoning
+        ws3.column_dimensions['J'].width = 22  # Suggested Page Type
+        ws3.column_dimensions['K'].width = 14  # Priority Score
     else:
         ws3.cell(row=1, column=1, value='No new content opportunities found (GSC query data required)')
     ws3.freeze_panes = 'A2'
