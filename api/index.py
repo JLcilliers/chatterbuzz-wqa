@@ -1591,6 +1591,318 @@ def build_thin_content_api(df: pd.DataFrame, thin_threshold: int = 1000) -> pd.D
     })
 
 
+# =============================================================================
+# BUSINESS RELEVANCE & FEASIBILITY FILTERING (API VERSION)
+# =============================================================================
+# These functions filter and score topics to ensure only realistic, sensible,
+# on-brand opportunities are surfaced. A topic must pass all three gates:
+# 1. Search Demand Gate (handled by clustering)
+# 2. SEO Feasibility Gate (handled by action recommendation)
+# 3. Business Relevance Gate (NEW - this module)
+
+# Exclusion terms - topics containing these are automatically excluded
+NAVIGATIONAL_TERMS_API = {
+    'login', 'signin', 'sign in', 'signup', 'sign up', 'logout', 'log out',
+    'register', 'forgot password', 'reset password', 'my account', 'dashboard',
+    'admin', 'portal', 'intranet', 'employee', 'staff only'
+}
+
+POLICY_LEGAL_TERMS_API = {
+    'privacy policy', 'terms of service', 'terms and conditions', 'cookie policy',
+    'gdpr', 'disclaimer', 'legal notice', 'refund policy', 'return policy',
+    'shipping policy', 'cancellation policy', 'accessibility statement'
+}
+
+JUNK_ARTIFACT_TERMS_API = {
+    'utm_', 'utm=', '?p=', '?s=', 'index.php', 'page=', 'amp', '&amp',
+    'session', 'sessionid', 'jsessionid', 'phpsessid', 'cfid', 'cftoken',
+    'www.', 'http://', 'https://', '.html', '.php', '.aspx', '.jsp'
+}
+
+AUTHORITY_REQUIRED_TERMS_API = {
+    # Medical - requires licensed practitioner
+    'diagnosis', 'treatment plan', 'medical advice', 'prescription', 'dosage',
+    'symptoms of', 'cure for', 'medication for', 'drug interaction',
+    # Legal - requires licensed attorney
+    'legal advice', 'attorney', 'lawsuit', 'sue for', 'liability for',
+    'contract law', 'legal rights', 'file a claim',
+    # Financial - requires licensed advisor
+    'investment advice', 'tax advice', 'financial planning', 'retirement planning',
+    'stock picks', 'crypto investment', 'guaranteed returns',
+    # Government - requires official authority
+    'official form', 'government application', 'visa application', 'passport renewal'
+}
+
+# Intent classification modifiers
+TRANSACTIONAL_MODIFIERS_API = {
+    'pricing', 'price', 'cost', 'quote', 'buy', 'purchase', 'order', 'hire',
+    'service', 'services', 'provider', 'providers', 'company', 'companies',
+    'contractor', 'contractors', 'professional', 'professionals', 'near me',
+    'in my area', 'local', 'get', 'schedule', 'book', 'appointment'
+}
+
+COMMERCIAL_MODIFIERS_API = {
+    'best', 'top', 'review', 'reviews', 'compare', 'comparison', 'vs', 'versus',
+    'alternative', 'alternatives', 'software', 'tool', 'tools', 'solution',
+    'solutions', 'platform', 'app', 'rated', 'recommended', 'affordable'
+}
+
+INFORMATIONAL_MODIFIERS_API = {
+    'how', 'what', 'why', 'when', 'where', 'guide', 'tutorial', 'tips',
+    'steps', 'process', 'explained', 'meaning', 'definition', 'example',
+    'examples', 'learn', 'understand', 'basics', 'introduction', 'overview'
+}
+
+
+def calculate_business_relevance_score_api(
+    topic_tokens: set,
+    primary_query: str,
+    site_context: dict = None
+) -> tuple:
+    """
+    Calculate Business Relevance Score (0-100) for a topic cluster - API version.
+    """
+    if site_context is None:
+        site_context = {}
+
+    query_lower = primary_query.lower()
+    notes = []
+    exclusion_reason = ""
+
+    # HARD EXCLUSION CHECKS
+    for term in NAVIGATIONAL_TERMS_API:
+        if term in query_lower:
+            return (0, "", True, f"Navigational intent: '{term}'")
+
+    for term in POLICY_LEGAL_TERMS_API:
+        if term in query_lower:
+            return (0, "", True, f"Policy/legal page: '{term}'")
+
+    for term in JUNK_ARTIFACT_TERMS_API:
+        if term in query_lower:
+            return (0, "", True, f"Junk/artifact term: '{term}'")
+
+    for term in AUTHORITY_REQUIRED_TERMS_API:
+        if term in query_lower:
+            return (0, "", True, f"Requires professional authority: '{term}'")
+
+    clean_query = ''.join(c for c in query_lower if c.isalnum() or c.isspace())
+    if len(clean_query.strip()) < 5:
+        return (0, "", True, "Query too short/malformed")
+
+    if clean_query.replace(' ', '').isdigit():
+        return (0, "", True, "Query is only numbers")
+
+    # COMPONENT 1: Site Theme Alignment (40%)
+    theme_score = 0
+    max_theme_score = 40
+
+    existing_urls = set(str(u).lower() for u in site_context.get('existing_urls', []))
+    existing_titles = set(str(t).lower() for t in site_context.get('existing_titles', []))
+    top_queries = set(str(q).lower() for q in site_context.get('top_queries', []))
+    site_categories = set(str(c).lower() for c in site_context.get('site_categories', []))
+
+    all_site_text = ' '.join(existing_urls) + ' ' + ' '.join(existing_titles) + ' ' + ' '.join(top_queries)
+    site_tokens = set(all_site_text.split())
+
+    if topic_tokens and site_tokens:
+        overlap = len(topic_tokens & site_tokens)
+        overlap_ratio = overlap / len(topic_tokens) if topic_tokens else 0
+
+        if overlap_ratio >= 0.6:
+            theme_score = max_theme_score
+        elif overlap_ratio >= 0.4:
+            theme_score = int(max_theme_score * 0.75)
+        elif overlap_ratio >= 0.2:
+            theme_score = int(max_theme_score * 0.5)
+        elif overlap_ratio > 0:
+            theme_score = int(max_theme_score * 0.25)
+        else:
+            theme_score = 0
+            notes.append("No site theme overlap")
+
+    for category in site_categories:
+        if category in query_lower:
+            theme_score = min(max_theme_score, theme_score + 10)
+            break
+
+    # COMPONENT 2: Commercial/Strategic Intent (30%)
+    intent_score = 0
+    max_intent_score = 30
+
+    transactional_matches = sum(1 for term in TRANSACTIONAL_MODIFIERS_API if term in query_lower)
+    commercial_matches = sum(1 for term in COMMERCIAL_MODIFIERS_API if term in query_lower)
+    informational_matches = sum(1 for term in INFORMATIONAL_MODIFIERS_API if term in query_lower)
+
+    if transactional_matches > 0:
+        intent_score = max_intent_score
+    elif commercial_matches > 0:
+        intent_score = int(max_intent_score * 0.7)
+    elif informational_matches > 0:
+        if theme_score >= max_theme_score * 0.5:
+            intent_score = int(max_intent_score * 0.4)
+        else:
+            intent_score = int(max_intent_score * 0.15)
+            notes.append("Informational intent with weak commercial tie-in")
+    else:
+        intent_score = int(max_intent_score * 0.3)
+
+    # COMPONENT 3: Content Feasibility (20%)
+    feasibility_score = 20
+    questionable_expertise = {
+        'diy', 'homemade', 'home remedy', 'self-diagnose', 'without professional',
+        'instead of doctor', 'instead of lawyer', 'free legal', 'free medical'
+    }
+
+    for term in questionable_expertise:
+        if term in query_lower:
+            feasibility_score = int(feasibility_score * 0.5)
+            notes.append(f"Questionable expertise required: '{term}'")
+            break
+
+    # COMPONENT 4: Brand Safety / Nonsense Filter (10%)
+    safety_score = 10
+
+    if len(query_lower.split()) > 8:
+        safety_score = int(safety_score * 0.7)
+        notes.append("Query unusually long")
+
+    word_list = query_lower.split()
+    if len(word_list) > len(set(word_list)) + 2:
+        safety_score = int(safety_score * 0.5)
+        notes.append("Repeated words in query")
+
+    # CALCULATE FINAL SCORE
+    total_score = theme_score + intent_score + feasibility_score + safety_score
+    total_score = max(0, min(100, total_score))
+
+    if total_score < 50:
+        exclusion_reason = f"Low business relevance score ({total_score}/100)"
+        return (total_score, '; '.join(notes) if notes else '', True, exclusion_reason)
+
+    return (total_score, '; '.join(notes) if notes else '', False, '')
+
+
+def build_site_context_from_df_api(df: pd.DataFrame, gsc_df: pd.DataFrame = None) -> dict:
+    """
+    Build site context dictionary from crawl and GSC data - API version.
+    """
+    context = {
+        'existing_urls': [],
+        'existing_titles': [],
+        'top_queries': [],
+        'site_categories': [],
+        'brand_terms': []
+    }
+
+    if df is not None and len(df) > 0:
+        if 'url' in df.columns:
+            context['existing_urls'] = df['url'].dropna().tolist()
+
+        if 'page_title' in df.columns:
+            context['existing_titles'] = df['page_title'].dropna().tolist()
+
+        if 'page_type' in df.columns:
+            categories = df['page_type'].dropna().unique().tolist()
+            for cat in categories:
+                context['site_categories'].extend(str(cat).lower().split())
+            context['site_categories'] = list(set(context['site_categories']))
+
+    if gsc_df is not None and len(gsc_df) > 0:
+        query_col = 'query' if 'query' in gsc_df.columns else 'primary_keyword'
+        if query_col in gsc_df.columns and 'impressions' in gsc_df.columns:
+            top_queries_df = gsc_df.nlargest(100, 'impressions')
+            context['top_queries'] = top_queries_df[query_col].dropna().tolist()
+        elif query_col in gsc_df.columns:
+            context['top_queries'] = gsc_df[query_col].dropna().head(100).tolist()
+
+    if context['existing_urls']:
+        from urllib.parse import urlparse
+        try:
+            sample_url = context['existing_urls'][0]
+            parsed = urlparse(sample_url)
+            domain_parts = parsed.netloc.replace('www.', '').split('.')
+            if domain_parts:
+                context['brand_terms'] = [domain_parts[0]]
+        except:
+            pass
+
+    return context
+
+
+def filter_topics_by_business_relevance_api(
+    topics_df: pd.DataFrame,
+    site_context: dict = None,
+    min_score: int = 50,
+    max_topics: int = 15
+) -> tuple:
+    """
+    Filter and score topics by business relevance - API version.
+    """
+    if topics_df is None or len(topics_df) == 0:
+        return topics_df, []
+
+    if site_context is None:
+        site_context = {}
+
+    relevance_scores = []
+    feasibility_notes = []
+    excluded_topics = []
+
+    for _, row in topics_df.iterrows():
+        primary_query = str(row.get('Primary Keyword', '')).strip()
+        secondary_keywords = str(row.get('Secondary Keywords', '')).strip()
+
+        all_keywords = primary_query + ' ' + secondary_keywords
+        tokens = set(all_keywords.lower().split())
+
+        score, notes, excluded, reason = calculate_business_relevance_score_api(
+            topic_tokens=tokens,
+            primary_query=primary_query,
+            site_context=site_context
+        )
+
+        if excluded:
+            excluded_topics.append({
+                'Topic': row.get('Suggested Topic', primary_query),
+                'Primary Keyword': primary_query,
+                'Score': score,
+                'Reason': reason
+            })
+            relevance_scores.append(0)
+            feasibility_notes.append(reason)
+        else:
+            relevance_scores.append(score)
+            feasibility_notes.append(notes if notes else '')
+
+    topics_df = topics_df.copy()
+    topics_df['Business Relevance Score'] = relevance_scores
+    topics_df['Feasibility Notes'] = feasibility_notes
+
+    mask = topics_df['Business Relevance Score'] >= min_score
+    filtered_df = topics_df[mask].copy()
+
+    if len(filtered_df) > 0:
+        filtered_df = filtered_df.sort_values(
+            ['Priority Score', 'Business Relevance Score'],
+            ascending=[False, False]
+        )
+        filtered_df = filtered_df.head(max_topics)
+
+    logger.info(f"[BUSINESS RELEVANCE] Topics before filtering: {len(topics_df)}")
+    logger.info(f"[BUSINESS RELEVANCE] Topics after filtering: {len(filtered_df)}")
+    logger.info(f"[BUSINESS RELEVANCE] Topics excluded: {len(excluded_topics)}")
+
+    if excluded_topics:
+        exclusion_reasons = {}
+        for ex in excluded_topics:
+            reason = ex['Reason'].split(':')[0] if ':' in ex['Reason'] else ex['Reason']
+            exclusion_reasons[reason] = exclusion_reasons.get(reason, 0) + 1
+        logger.info(f"[BUSINESS RELEVANCE] Exclusion breakdown: {exclusion_reasons}")
+
+    return filtered_df, excluded_topics
+
+
 def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 20, thin_urls: set = None, url_word_counts: dict = None) -> pd.DataFrame:
     """
     Cluster similar queries into topic groups for new content opportunities.
@@ -1923,10 +2235,11 @@ def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.Da
 
     Includes cannibalization detection to exclude topics where a strong page already exists.
     """
+    # Define output columns (includes Business Relevance columns)
     empty_columns = [
         'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
         'Avg Position', 'Recommended Action', 'Primary URL', 'Secondary URLs', 'Reasoning',
-        'Suggested Page Type', 'Priority Score'
+        'Suggested Page Type', 'Priority Score', 'Business Relevance Score', 'Feasibility Notes'
     ]
 
     if gsc_df is None or len(gsc_df) == 0:
@@ -2000,7 +2313,33 @@ def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.Da
     if len(result) == 0:
         return pd.DataFrame(columns=empty_columns)
 
-    return result
+    # =========================================================================
+    # BUSINESS RELEVANCE FILTERING (Gate 3)
+    # =========================================================================
+    # Build site context from crawl and GSC data
+    site_context = build_site_context_from_df_api(df, gsc_df)
+
+    # Apply business relevance filtering
+    filtered_result, excluded_topics = filter_topics_by_business_relevance_api(
+        topics_df=result,
+        site_context=site_context,
+        min_score=50,  # Minimum score threshold
+        max_topics=15  # Cap to 15 topics max
+    )
+
+    # Log excluded topics for debugging
+    if excluded_topics:
+        logger.debug(f"[NEW CONTENT] Excluded {len(excluded_topics)} topics by business relevance filter")
+        for ex in excluded_topics[:5]:  # Log first 5
+            logger.debug(f"  - Excluded: {ex.get('Primary Keyword', 'N/A')} | Reason: {ex.get('Reason', 'N/A')}")
+
+    # Ensure all expected columns exist
+    for col in empty_columns:
+        if col not in filtered_result.columns:
+            filtered_result[col] = ''
+
+    # Reorder columns to match expected output
+    return filtered_result[empty_columns]
 
 
 def build_redirect_merge_plan_api(new_content_df: pd.DataFrame) -> pd.DataFrame:

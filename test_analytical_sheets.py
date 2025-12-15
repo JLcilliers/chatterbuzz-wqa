@@ -246,6 +246,140 @@ def run_clustering_unit_tests() -> bool:
                 tests_passed += 1
 
     # =========================================================================
+    # Test 7: Business Relevance - Navigational queries should be excluded
+    # =========================================================================
+    tests_total += 1
+    print("Test 7: Business Relevance - Navigational queries should be excluded...")
+
+    try:
+        from wqa_generator import calculate_business_relevance_score
+    except ImportError:
+        errors.append("Test 7 FAILED: Could not import calculate_business_relevance_score")
+    else:
+        # Test navigational exclusion
+        score, notes, excluded, reason = calculate_business_relevance_score(
+            topic_tokens={'login', 'account', 'page'},
+            primary_query='login to my account',
+            site_context={}
+        )
+        if excluded and 'Navigational' in reason:
+            print(f"  [OK] Navigational query correctly excluded: {reason}")
+            tests_passed += 1
+        else:
+            errors.append(f"Test 7 FAILED: Navigational query not excluded (score={score}, excluded={excluded})")
+
+    # =========================================================================
+    # Test 8: Business Relevance - Policy/legal queries should be excluded
+    # =========================================================================
+    tests_total += 1
+    print("Test 8: Business Relevance - Policy/legal queries should be excluded...")
+
+    try:
+        score, notes, excluded, reason = calculate_business_relevance_score(
+            topic_tokens={'privacy', 'policy', 'data'},
+            primary_query='privacy policy',
+            site_context={}
+        )
+        if excluded and 'Policy/legal' in reason:
+            print(f"  [OK] Policy query correctly excluded: {reason}")
+            tests_passed += 1
+        else:
+            errors.append(f"Test 8 FAILED: Policy query not excluded (score={score}, excluded={excluded})")
+    except Exception as e:
+        errors.append(f"Test 8 FAILED: Exception - {e}")
+
+    # =========================================================================
+    # Test 9: Business Relevance - Authority-required queries should be excluded
+    # =========================================================================
+    tests_total += 1
+    print("Test 9: Business Relevance - Authority-required queries should be excluded...")
+
+    try:
+        score, notes, excluded, reason = calculate_business_relevance_score(
+            topic_tokens={'medical', 'advice', 'treatment'},
+            primary_query='medical advice for headaches',
+            site_context={}
+        )
+        if excluded and 'authority' in reason.lower():
+            print(f"  [OK] Authority-required query correctly excluded: {reason}")
+            tests_passed += 1
+        else:
+            errors.append(f"Test 9 FAILED: Authority query not excluded (score={score}, excluded={excluded})")
+    except Exception as e:
+        errors.append(f"Test 9 FAILED: Exception - {e}")
+
+    # =========================================================================
+    # Test 10: Business Relevance - Transactional queries should score high
+    # =========================================================================
+    tests_total += 1
+    print("Test 10: Business Relevance - Transactional queries should score high...")
+
+    try:
+        site_context = {
+            'existing_urls': ['https://example.com/roofing', 'https://example.com/services'],
+            'existing_titles': ['Roofing Services Atlanta', 'Professional Roofing Contractors'],
+            'top_queries': ['roofing services', 'roof repair', 'roofing contractor'],
+            'site_categories': ['roofing', 'contractors', 'services']
+        }
+        score, notes, excluded, reason = calculate_business_relevance_score(
+            topic_tokens={'roofing', 'services', 'pricing', 'near', 'me'},
+            primary_query='roofing services pricing near me',
+            site_context=site_context
+        )
+        if not excluded and score >= 70:
+            print(f"  [OK] Transactional query scored high: {score}/100")
+            tests_passed += 1
+        else:
+            errors.append(f"Test 10 FAILED: Transactional query scored low (score={score}, excluded={excluded})")
+    except Exception as e:
+        errors.append(f"Test 10 FAILED: Exception - {e}")
+
+    # =========================================================================
+    # Test 11: Business Relevance - filter_topics_by_business_relevance integration
+    # =========================================================================
+    tests_total += 1
+    print("Test 11: Business Relevance - filter_topics_by_business_relevance integration...")
+
+    try:
+        from wqa_generator import filter_topics_by_business_relevance
+
+        topics_df = pd.DataFrame([
+            {'Suggested Topic': 'Roofing Services', 'Primary Keyword': 'roofing services atlanta', 'Secondary Keywords': 'roof repair, roofing contractor', 'Priority Score': 85},
+            {'Suggested Topic': 'Login Page', 'Primary Keyword': 'login to my account', 'Secondary Keywords': 'sign in, account access', 'Priority Score': 50},
+            {'Suggested Topic': 'Privacy Policy', 'Primary Keyword': 'privacy policy', 'Secondary Keywords': 'data policy', 'Priority Score': 40},
+            {'Suggested Topic': 'Roof Repair Cost', 'Primary Keyword': 'roof repair cost', 'Secondary Keywords': 'roofing prices', 'Priority Score': 75},
+        ])
+
+        site_context = {
+            'existing_urls': ['https://example.com/roofing'],
+            'existing_titles': ['Roofing Services'],
+            'top_queries': ['roofing', 'roof repair'],
+            'site_categories': ['roofing', 'services']
+        }
+
+        filtered_df, excluded = filter_topics_by_business_relevance(
+            topics_df=topics_df,
+            site_context=site_context,
+            min_score=50,
+            max_topics=15
+        )
+
+        # Check that navigational and policy topics were excluded
+        excluded_keywords = [ex.get('Primary Keyword', '') for ex in excluded]
+        if 'login to my account' in excluded_keywords and 'privacy policy' in excluded_keywords:
+            # Check that roofing topics were kept
+            remaining_keywords = filtered_df['Primary Keyword'].tolist()
+            if 'roofing services atlanta' in remaining_keywords or 'roof repair cost' in remaining_keywords:
+                print(f"  [OK] Filtered to {len(filtered_df)} topics, excluded {len(excluded)} topics")
+                tests_passed += 1
+            else:
+                errors.append(f"Test 11 FAILED: Valid roofing topics were incorrectly excluded")
+        else:
+            errors.append(f"Test 11 FAILED: Navigational/policy topics not excluded. Excluded: {excluded_keywords}")
+    except Exception as e:
+        errors.append(f"Test 11 FAILED: Exception - {e}")
+
+    # =========================================================================
     # Summary
     # =========================================================================
     print()
