@@ -267,6 +267,118 @@ def verify_analytical_sheets(excel_path: str) -> bool:
 
     print()
 
+    # ==========================================================================
+    # Verify Sheet 4: Redirect & Merge Plan
+    # ==========================================================================
+    sheet_name = 'Redirect & Merge Plan'
+    print(f"Checking '{sheet_name}'...")
+
+    if sheet_name not in wb.sheetnames:
+        # Sheet may not exist if no consolidations were found
+        print(f"  [INFO] Sheet '{sheet_name}' not found (expected if no consolidations)")
+    else:
+        ws = wb[sheet_name]
+        print(f"  [OK] Sheet exists")
+
+        # Check for expected headers
+        expected_headers = [
+            'Topic', 'Recommended Action', 'Primary URL', 'Secondary URL',
+            'Redirect Type', 'Reason'
+        ]
+
+        # Check if sheet has data or the "no redirects" message
+        first_cell = ws.cell(row=1, column=1).value
+        if first_cell == 'No consolidation redirects needed (no "Consolidate pages" actions found)':
+            print(f"  [OK] Sheet has 'no redirects' message (no consolidations found)")
+        else:
+            # Check headers
+            for col_idx, expected in enumerate(expected_headers, start=1):
+                actual = ws.cell(row=1, column=col_idx).value
+                if actual != expected:
+                    errors.append(f"  {sheet_name}: Column {col_idx} header - expected '{expected}', got '{actual}'")
+                else:
+                    print(f"  [OK] Column {col_idx}: '{expected}'")
+
+            # Check freeze panes
+            if ws.freeze_panes != 'A2':
+                warnings.append(f"  {sheet_name}: Freeze panes expected 'A2', got '{ws.freeze_panes}'")
+            else:
+                print(f"  [OK] Freeze panes at A2")
+
+            # Count data rows
+            row_count = ws.max_row - 1  # Exclude header
+            print(f"  [OK] Data rows: {row_count}")
+
+            # ======================================================================
+            # Redirect & Merge Plan Validation
+            # ======================================================================
+            print(f"  Validating Redirect Plan...")
+
+            # Column indices (1-based)
+            action_col = 2      # Recommended Action
+            primary_url_col = 3  # Primary URL
+            secondary_url_col = 4  # Secondary URL
+            redirect_type_col = 5  # Redirect Type
+
+            secondary_urls_seen = set()
+            primary_urls_seen = set()
+            non_consolidate_actions = 0
+            non_301_types = 0
+            duplicate_secondary = 0
+            primary_as_secondary = 0
+
+            for row_idx in range(2, ws.max_row + 1):
+                action = ws.cell(row=row_idx, column=action_col).value
+                primary_url = ws.cell(row=row_idx, column=primary_url_col).value or ''
+                secondary_url = ws.cell(row=row_idx, column=secondary_url_col).value or ''
+                redirect_type = ws.cell(row=row_idx, column=redirect_type_col).value or ''
+
+                # Check: Only consolidation actions should generate redirects
+                if action != 'Consolidate pages':
+                    non_consolidate_actions += 1
+
+                # Check: Redirect Type should always be "301"
+                if str(redirect_type) != '301':
+                    non_301_types += 1
+
+                # Track primary URLs
+                if primary_url:
+                    primary_urls_seen.add(primary_url)
+
+                # Check: Each Secondary URL appears exactly once
+                if secondary_url:
+                    if secondary_url in secondary_urls_seen:
+                        duplicate_secondary += 1
+                    secondary_urls_seen.add(secondary_url)
+
+            # Check: Primary URL never appears as Secondary URL
+            for primary in primary_urls_seen:
+                if primary in secondary_urls_seen:
+                    primary_as_secondary += 1
+
+            # Report validation results
+            if non_consolidate_actions > 0:
+                errors.append(f"  {sheet_name}: {non_consolidate_actions} row(s) have non-'Consolidate pages' action")
+            else:
+                print(f"  [OK] All redirects are for 'Consolidate pages' actions")
+
+            if non_301_types > 0:
+                errors.append(f"  {sheet_name}: {non_301_types} row(s) have redirect type != '301'")
+            else:
+                print(f"  [OK] All redirects are type '301'")
+
+            if duplicate_secondary > 0:
+                errors.append(f"  {sheet_name}: {duplicate_secondary} duplicate Secondary URL(s) found")
+            else:
+                print(f"  [OK] Each Secondary URL appears exactly once")
+
+            if primary_as_secondary > 0:
+                errors.append(f"  {sheet_name}: {primary_as_secondary} Primary URL(s) also appear as Secondary URL")
+            else:
+                print(f"  [OK] No Primary URL appears as Secondary URL")
+
+    print()
+
     # Close workbook
     wb.close()
 

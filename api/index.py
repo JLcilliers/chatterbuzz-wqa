@@ -2002,6 +2002,93 @@ def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.Da
     return result
 
 
+def build_redirect_merge_plan_api(new_content_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the 'Redirect & Merge Plan' sheet from consolidation recommendations - API version.
+
+    Generates a 301 redirect mapping for every topic where the Recommended Action
+    is "Consolidate pages". Each Secondary URL gets its own row mapping to the
+    Primary URL.
+
+    Args:
+        new_content_df: DataFrame from build_new_content_opportunities_api
+            containing Recommended Action, Primary URL, Secondary URLs columns
+
+    Returns:
+        DataFrame with columns: Topic, Recommended Action, Primary URL,
+        Secondary URL, Redirect Type, Reason
+    """
+    empty_columns = [
+        'Topic', 'Recommended Action', 'Primary URL', 'Secondary URL',
+        'Redirect Type', 'Reason'
+    ]
+
+    if new_content_df is None or len(new_content_df) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    # Filter for consolidation actions only
+    consolidations = new_content_df[
+        new_content_df['Recommended Action'] == 'Consolidate pages'
+    ].copy()
+
+    if len(consolidations) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    redirect_rows = []
+
+    for _, row in consolidations.iterrows():
+        topic = row.get('Suggested Topic', '')
+        primary_url = row.get('Primary URL', '')
+        secondary_urls_str = row.get('Secondary URLs', '')
+
+        # Skip if no primary URL or secondary URLs
+        if not primary_url or not secondary_urls_str:
+            continue
+
+        # Parse secondary URLs (comma-separated)
+        secondary_urls = [
+            url.strip() for url in secondary_urls_str.split(',')
+            if url.strip() and url.strip() != primary_url
+        ]
+
+        # Skip if no valid secondary URLs after filtering
+        if not secondary_urls:
+            continue
+
+        # Generate redirect entries for each secondary URL
+        for secondary_url in secondary_urls:
+            # Generate redirect-specific reasoning
+            reason = (
+                f"This page competes for the same keywords as the primary page "
+                f"({primary_url[:50]}...) but has weaker rankings and engagement. "
+                f"Redirecting consolidates authority and prevents keyword cannibalization."
+            )
+
+            redirect_rows.append({
+                'Topic': topic,
+                'Recommended Action': 'Consolidate pages',
+                'Primary URL': primary_url,
+                'Secondary URL': secondary_url,
+                'Redirect Type': '301',
+                'Reason': reason
+            })
+
+    if not redirect_rows:
+        return pd.DataFrame(columns=empty_columns)
+
+    result_df = pd.DataFrame(redirect_rows)
+
+    # Remove any duplicate redirects (same Secondary URL)
+    result_df = result_df.drop_duplicates(subset=['Secondary URL'], keep='first')
+
+    # Ensure no self-redirects (Primary URL == Secondary URL)
+    result_df = result_df[result_df['Primary URL'] != result_df['Secondary URL']]
+
+    logger.info(f"Generated {len(result_df)} redirect entries from {len(consolidations)} consolidation topics")
+
+    return result_df
+
+
 def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_threshold: int = 1000, gsc_df: Optional[pd.DataFrame] = None) -> None:
     """Write analytical insight sheets to workbook - API version."""
     from openpyxl.styles import Font, PatternFill
@@ -2076,6 +2163,33 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
         ws3.cell(row=1, column=1, value='No new content opportunities found (GSC query data required)')
     ws3.freeze_panes = 'A2'
     logger.info(f"Wrote New Content Opportunities sheet: {len(new_content_df)} topics")
+
+    # Sheet 4: Redirect & Merge Plan (for consolidation actions)
+    redirect_df = build_redirect_merge_plan_api(new_content_df)
+    ws4 = workbook.create_sheet(title='Redirect & Merge Plan')
+
+    if len(redirect_df) > 0:
+        for col_idx, col_name in enumerate(redirect_df.columns, start=1):
+            cell = ws4.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        for row_idx, row in enumerate(redirect_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws4.cell(row=row_idx, column=col_idx, value=value)
+
+        # Column widths for redirect plan
+        ws4.column_dimensions['A'].width = 35  # Topic
+        ws4.column_dimensions['B'].width = 20  # Recommended Action
+        ws4.column_dimensions['C'].width = 70  # Primary URL (destination)
+        ws4.column_dimensions['D'].width = 70  # Secondary URL (source)
+        ws4.column_dimensions['E'].width = 14  # Redirect Type
+        ws4.column_dimensions['F'].width = 100  # Reason
+    else:
+        ws4.cell(row=1, column=1, value='No consolidation redirects needed (no "Consolidate pages" actions found)')
+
+    ws4.freeze_panes = 'A2'
+    logger.info(f"Wrote Redirect & Merge Plan sheet: {len(redirect_df)} redirects")
 
 
 def create_excel_report(
