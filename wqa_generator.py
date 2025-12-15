@@ -1621,9 +1621,17 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, 
     # Filter and score clusters with Content Action Recommendation logic
     topic_opportunities = []
 
+    # DEBUG: Log clustering pipeline statistics
+    logger.info(f"[CLUSTER DEBUG] Total clusters formed: {len(clusters)}")
+    clusters_skipped_low_volume = 0
+    clusters_with_dominant_page = 0
+    clusters_processed = 0
+    action_distribution = {'Create new page': 0, 'Expand existing page': 0, 'Consolidate pages': 0}
+
     for cluster in clusters:
         # Skip clusters with only 1 query and low impressions
         if len(cluster['queries']) == 1 and cluster['total_impressions'] < 100:
+            clusters_skipped_low_volume += 1
             continue
 
         # Calculate weighted average position
@@ -1693,12 +1701,14 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, 
         secondary_urls = ""
         reasoning = ""
 
-        # Check for strong dominant page that should be EXCLUDED entirely
+        # Track clusters with dominant pages for debugging (but DO NOT exclude them)
         if dominant_url and dominant_data:
-            # Strong existing page - EXCLUDE from recommendations
-            logger.debug(f"Excluding topic '{cluster['primary_query']}' - dominant page {dominant_url} "
-                        f"has {dominant_data['share']:.0%} impressions at position {dominant_data['avg_position']:.1f}")
-            continue
+            clusters_with_dominant_page += 1
+            logger.debug(f"[CLUSTER DEBUG] Topic '{cluster['primary_query']}' has dominant page {dominant_url} "
+                        f"({dominant_data['share']:.0%} impressions at position {dominant_data['avg_position']:.1f}) - evaluating for action")
+            # NOTE: Previously this would `continue` and exclude the cluster.
+            # Now we flow through to assign an appropriate action (usually Expand existing page)
+            # This ensures cannibalization detection can still happen for edge cases
 
         # DECISION LOGIC
         if num_urls == 0:
@@ -1751,8 +1761,15 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, 
             # Two URLs - check for consolidation vs expansion
             url1, url2 = url_analysis[0], url_analysis[1]
 
-            # Check if both receive meaningful impressions (at least 20% each)
-            if url1['share'] < 0.80 and url2['share'] >= 0.15:
+            # Consolidation triggers (loosened for better cannibalization detection):
+            # 1. Neither URL exceeds 60% dominance (true competition)
+            # 2. Second URL has at least 12% share (meaningful competitor)
+            # 3. URLs rank within 5 positions of each other (close competition)
+            no_clear_dominant = url1['share'] < 0.60
+            meaningful_second = url2['share'] >= 0.12
+            close_rankings = abs(url1['avg_position'] - url2['avg_position']) <= 5 and url2['avg_position'] > 0
+
+            if no_clear_dominant or (meaningful_second and close_rankings):
                 # Both URLs competing - Consolidate
                 recommended_action = "Consolidate pages"
                 primary_url = url1['url']
@@ -1769,13 +1786,28 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, 
             # 3+ URLs - Consolidation needed
             # Select top URLs for consolidation (max 3)
             top_urls = url_analysis[:3]
-            meaningful_urls = [u for u in top_urls if u['share'] >= 0.10]
+            meaningful_urls = [u for u in top_urls if u['share'] >= 0.08]  # Lowered from 0.10 to catch more competition
 
-            if len(meaningful_urls) >= 2:
+            # Additional consolidation trigger: close rankings between top URLs
+            close_ranking_urls = []
+            if len(url_analysis) >= 2:
+                best_pos = url_analysis[0]['avg_position']
+                for u in url_analysis[1:3]:  # Check top 3
+                    if u['avg_position'] > 0 and abs(u['avg_position'] - best_pos) <= 5:
+                        close_ranking_urls.append(u)
+
+            # Consolidate if: 2+ URLs have meaningful share OR 2+ URLs rank closely
+            should_consolidate = len(meaningful_urls) >= 2 or (len(close_ranking_urls) >= 1 and url_analysis[0]['share'] < 0.70)
+
+            if should_consolidate:
+                # Build list of URLs to consolidate (prefer meaningful share, include close rankers)
+                consolidate_urls = list(meaningful_urls) if len(meaningful_urls) >= 2 else [url_analysis[0]] + close_ranking_urls[:2]
+                consolidate_urls = consolidate_urls[:3]  # Cap at 3
+
                 recommended_action = "Consolidate pages"
-                primary_url = meaningful_urls[0]['url']
-                secondary_urls = ', '.join([u['url'] for u in meaningful_urls[1:]])
-                url_summary = '; '.join([f"{u['url'][:40]}... ({u['share']:.0%})" for u in meaningful_urls])
+                primary_url = consolidate_urls[0]['url']
+                secondary_urls = ', '.join([u['url'] for u in consolidate_urls[1:]])
+                url_summary = '; '.join([f"{u['url'][:40]}... ({u['share']:.0%})" for u in consolidate_urls])
                 reasoning = f"Traffic is fragmented across {num_urls} pages causing keyword cannibalization. Top competing pages: {url_summary}. Consolidate into one authoritative hub."
             elif url_analysis[0]['avg_position'] > 20:
                 # Fragmented but all ranking poorly - Create new
@@ -1863,6 +1895,27 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, 
             1
         )
 
+        # SAFETY: Ensure no cluster falls through without an action
+        # This guarantees every qualifying cluster gets a recommendation
+        if not recommended_action:
+            # Default fallback - should rarely happen with above logic
+            if num_urls == 0:
+                recommended_action = "Create new page"
+                reasoning = f"Search demand exists ({cluster['total_impressions']:,} impressions) with no current coverage. Create dedicated content."
+            elif url_analysis:
+                recommended_action = "Expand existing page"
+                primary_url = url_analysis[0]['url']
+                reasoning = f"Existing page could be expanded to better capture this topic's full potential."
+            else:
+                recommended_action = "Create new page"
+                reasoning = f"Content gap identified - create new targeted content."
+            logger.debug(f"[CLUSTER DEBUG] Applied fallback action '{recommended_action}' to topic '{cluster['primary_query']}'")
+
+        # Track action distribution
+        clusters_processed += 1
+        if recommended_action in action_distribution:
+            action_distribution[recommended_action] += 1
+
         topic_opportunities.append({
             'Suggested Topic': suggested_topic,
             'Primary Keyword': primary_query,
@@ -1877,7 +1930,16 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, 
             'Priority Score': priority_score
         })
 
+    # DEBUG: Log pipeline summary
+    logger.info(f"[CLUSTER DEBUG] Pipeline summary:")
+    logger.info(f"  - Clusters formed: {len(clusters)}")
+    logger.info(f"  - Skipped (low volume): {clusters_skipped_low_volume}")
+    logger.info(f"  - With dominant page (now processed, not excluded): {clusters_with_dominant_page}")
+    logger.info(f"  - Processed into opportunities: {clusters_processed}")
+    logger.info(f"  - Action distribution: {action_distribution}")
+
     if not topic_opportunities:
+        logger.warning("[CLUSTER DEBUG] No topic opportunities generated - all clusters were filtered or empty input")
         return pd.DataFrame()
 
     # Sort by priority score and limit to max_topics
@@ -2508,6 +2570,32 @@ def write_analytical_sheets(workbook, df: pd.DataFrame, thin_threshold: int = 10
 
     ws5.freeze_panes = 'A2'
     logger.info(f"Wrote Merge Playbooks sheet: {len(playbook_df)} entries")
+
+    # GUARD: Log warning if GSC data exists but all related sheets are empty
+    # This indicates a potential logic issue that should be investigated
+    gsc_has_data = gsc_df is not None and len(gsc_df) > 0
+    new_content_empty = len(new_content_df) == 0
+    redirect_empty = len(redirect_df) == 0
+    playbook_empty = len(playbook_df) == 0
+
+    if gsc_has_data and new_content_empty:
+        logger.warning("[GUARD] GSC data exists but New Content Opportunities is empty - check clustering logic")
+        logger.warning(f"[GUARD] GSC data has {len(gsc_df)} rows")
+
+    # Count action types in new_content_df
+    consolidate_count = 0
+    if len(new_content_df) > 0 and 'Recommended Action' in new_content_df.columns:
+        consolidate_count = len(new_content_df[new_content_df['Recommended Action'] == 'Consolidate pages'])
+        create_count = len(new_content_df[new_content_df['Recommended Action'] == 'Create new page'])
+        expand_count = len(new_content_df[new_content_df['Recommended Action'] == 'Expand existing page'])
+        logger.info(f"[GUARD] Action summary: Create={create_count}, Expand={expand_count}, Consolidate={consolidate_count}")
+
+    # If consolidate actions exist but downstream sheets are empty, log an error
+    if consolidate_count > 0 and redirect_empty:
+        logger.error(f"[GUARD] {consolidate_count} consolidation actions exist but Redirect & Merge Plan is empty - check downstream logic")
+
+    if consolidate_count > 0 and playbook_empty:
+        logger.error(f"[GUARD] {consolidate_count} consolidation actions exist but Merge Playbooks is empty - check downstream logic")
 
 
 def write_excel(
