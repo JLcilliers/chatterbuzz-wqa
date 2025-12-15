@@ -1249,102 +1249,6 @@ def generate_summary(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
 
 
 # =============================================================================
-# EXCEL OUTPUT
-# =============================================================================
-
-def write_seo_report_template(workbook) -> None:
-    """
-    Create an SEO Report Template sheet with blank sections for manual completion.
-
-    Creates two sections:
-    - Section 1: Pages Report (Page, URL, Traffic, Change, Changes Made)
-    - Section 2: Top Keywords (Keyword, Rank, Change, Volume, Difficulty)
-
-    Args:
-        workbook: openpyxl Workbook object to add the sheet to
-    """
-    # Create the sheet
-    ws = workbook.create_sheet(title='SEO Report Template')
-
-    # Define styles
-    bold_font = Font(bold=True)
-    section_font = Font(bold=True, size=12)
-    wrap_alignment = Alignment(wrap_text=True, vertical='top')
-
-    # ==========================================================================
-    # Header Fields (rows 1-4)
-    # ==========================================================================
-    header_fields = [
-        ('Company:', ''),
-        ('Created by:', ''),
-        ('Month/Year:', ''),
-        ('Key Figures:', ''),
-    ]
-
-    for row_idx, (label, value) in enumerate(header_fields, start=1):
-        ws.cell(row=row_idx, column=1, value=label).font = bold_font
-        ws.cell(row=row_idx, column=2, value=value)
-
-    # Row 5 is blank (spacer)
-
-    # ==========================================================================
-    # Section 1: Pages Report (starting row 6)
-    # ==========================================================================
-    section1_title_row = 6
-    section1_header_row = 7
-    section1_data_start = 8
-    section1_data_rows = 25  # 25 blank rows for data entry
-
-    # Section title
-    ws.cell(row=section1_title_row, column=1, value='Section 1: Pages Report').font = section_font
-
-    # Table headers
-    pages_headers = ['Page', 'URL', 'Traffic This Month', 'Change From Last Month', 'Changes Made to the Page']
-    for col_idx, header in enumerate(pages_headers, start=1):
-        cell = ws.cell(row=section1_header_row, column=col_idx, value=header)
-        cell.font = bold_font
-
-    # Add blank rows for data entry (rows 8-32)
-    # No content needed, just ensure the rows exist
-
-    # ==========================================================================
-    # Section 2: Top Keywords (starting after Pages section with 2 blank rows)
-    # ==========================================================================
-    section2_title_row = section1_data_start + section1_data_rows + 2  # Row 35
-    section2_header_row = section2_title_row + 1  # Row 36
-    section2_data_rows = 25  # 25 blank rows for data entry
-
-    # Section title
-    ws.cell(row=section2_title_row, column=1, value='Section 2: Top Keywords').font = section_font
-
-    # Table headers
-    keywords_headers = ['Top Keywords', 'Rank', 'Change in Rank From Last Month', 'Volume', 'Difficulty (Ahrefs)']
-    for col_idx, header in enumerate(keywords_headers, start=1):
-        cell = ws.cell(row=section2_header_row, column=col_idx, value=header)
-        cell.font = bold_font
-
-    # ==========================================================================
-    # Formatting: Column Widths
-    # ==========================================================================
-    column_widths = {
-        1: 30,   # A: Page / Top Keywords
-        2: 50,   # B: URL / Rank
-        3: 22,   # C: Traffic This Month / Change in Rank
-        4: 25,   # D: Change From Last Month / Volume
-        5: 30,   # E: Changes Made / Difficulty
-    }
-
-    for col_num, width in column_widths.items():
-        ws.column_dimensions[get_column_letter(col_num)].width = width
-
-    # ==========================================================================
-    # Formatting: Freeze Panes
-    # ==========================================================================
-    # Freeze at row 8 (A8) so header fields and Section 1 headers stay visible
-    ws.freeze_panes = 'A8'
-
-
-# =============================================================================
 # ANALYTICAL INSIGHT SHEETS
 # =============================================================================
 
@@ -1598,16 +1502,20 @@ def build_thin_content_sheet(df: pd.DataFrame, thin_threshold: int = 1000) -> pd
     return result
 
 
-def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) -> pd.DataFrame:
+def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20, thin_urls: set = None) -> pd.DataFrame:
     """
     Cluster similar queries into topic groups for new content opportunities.
 
     Uses a simple word-overlap algorithm to group queries that share
     significant terms, creating topic clusters from individual queries.
 
+    Implements cannibalization detection to exclude topics where a strong
+    existing page already dominates (>=60% impressions AND avg position <=15).
+
     Args:
-        queries_df: DataFrame with query-level data (query, impressions, clicks, avg_position)
+        queries_df: DataFrame with query-level data (query, impressions, clicks, avg_position, url)
         max_topics: Maximum number of topic clusters to return
+        thin_urls: Set of URLs flagged as thin content (optional, for cannibalization checks)
 
     Returns:
         DataFrame with topic clusters, each containing primary/secondary keywords
@@ -1617,6 +1525,9 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
 
     if queries_df is None or len(queries_df) == 0:
         return pd.DataFrame()
+
+    if thin_urls is None:
+        thin_urls = set()
 
     # Normalize and tokenize queries
     def tokenize(query):
@@ -1665,8 +1576,14 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
             'total_impressions': seed['impressions'],
             'total_clicks': seed['clicks'],
             'positions': [seed['avg_position']] if seed['avg_position'] > 0 else [],
-            'urls': {seed['url']} if seed['url'] else set()
+            'urls': defaultdict(lambda: {'impressions': 0, 'positions': [], 'clicks': 0})
         }
+        # Track URL-level metrics for cannibalization detection
+        if seed['url']:
+            cluster['urls'][seed['url']]['impressions'] += seed['impressions']
+            cluster['urls'][seed['url']]['clicks'] += seed['clicks']
+            if seed['avg_position'] > 0:
+                cluster['urls'][seed['url']]['positions'].append(seed['avg_position'])
         used_queries.add(seed['query'])
 
         # Find similar queries (at least 50% token overlap with seed)
@@ -1685,13 +1602,17 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
                 cluster['total_clicks'] += candidate['clicks']
                 if candidate['avg_position'] > 0:
                     cluster['positions'].append(candidate['avg_position'])
+                # Track URL-level metrics
                 if candidate['url']:
-                    cluster['urls'].add(candidate['url'])
+                    cluster['urls'][candidate['url']]['impressions'] += candidate['impressions']
+                    cluster['urls'][candidate['url']]['clicks'] += candidate['clicks']
+                    if candidate['avg_position'] > 0:
+                        cluster['urls'][candidate['url']]['positions'].append(candidate['avg_position'])
                 used_queries.add(candidate['query'])
 
         clusters.append(cluster)
 
-    # Filter and score clusters
+    # Filter and score clusters with cannibalization detection
     topic_opportunities = []
 
     for cluster in clusters:
@@ -1716,8 +1637,50 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
         else:
             avg_position = 0
 
+        # =====================================================================
+        # CANNIBALIZATION DETECTION
+        # =====================================================================
+        url_metrics = cluster['urls']
+        num_urls = len(url_metrics)
+        dominant_url = None
+        dominant_share = 0
+        dominant_position = None
+        has_dominant_page = False
+        cannibalization_risk = "No"
+        cannibalization_reason = ""
+
+        if cluster['total_impressions'] > 0 and num_urls > 0:
+            # Calculate impression share per URL
+            for url, metrics in url_metrics.items():
+                url_share = metrics['impressions'] / cluster['total_impressions']
+                if url_share > dominant_share:
+                    dominant_share = url_share
+                    dominant_url = url
+                    # Calculate average position for this URL
+                    if metrics['positions']:
+                        dominant_position = sum(metrics['positions']) / len(metrics['positions'])
+
+            # Check if dominant page meets exclusion criteria:
+            # >= 60% impressions AND avg position <= 15 AND not thin content
+            if dominant_url and dominant_share >= 0.60 and dominant_position is not None:
+                if dominant_position <= 15 and dominant_url not in thin_urls:
+                    # This topic has a strong existing page - EXCLUDE from new content
+                    has_dominant_page = True
+                    logger.debug(f"Excluding topic '{cluster['primary_query']}' - dominant page {dominant_url} "
+                                f"has {dominant_share:.0%} impressions at position {dominant_position:.1f}")
+                    continue  # Skip this cluster entirely
+                elif dominant_position <= 15 and dominant_url in thin_urls:
+                    # Dominant page exists but is thin - flag as cannibalization risk
+                    cannibalization_risk = "Yes"
+                    cannibalization_reason = f"Thin page {dominant_url[:50]}... ranks at position {dominant_position:.0f} with {dominant_share:.0%} impressions - consider expanding vs. new page"
+
+        # Check for split traffic cannibalization risk (traffic fragmented across multiple pages)
+        if num_urls > 2 and not cannibalization_risk.startswith("Yes"):
+            # Multiple pages splitting traffic
+            cannibalization_risk = "Yes"
+            cannibalization_reason = f"Traffic split across {num_urls} URLs - consolidate existing pages or create authoritative hub"
+
         # Determine opportunity type and reason
-        num_urls = len(cluster['urls'])
         primary_query = cluster['primary_query']
 
         # Determine why this is an opportunity
@@ -1725,11 +1688,11 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
         if num_urls == 0:
             reasons.append("no landing page exists for these queries")
         elif num_urls > 2:
-            reasons.append("traffic is split across multiple pages")
+            reasons.append("traffic is split across multiple pages (consolidation needed)")
         if avg_position > 15:
             reasons.append(f"current ranking is weak (avg position {avg_position:.0f})")
         if cluster['total_impressions'] >= 100 and cluster['total_clicks'] < 10:
-            reasons.append("high impressions but very few clicks")
+            reasons.append("high impressions but very few clicks (intent mismatch)")
 
         if not reasons:
             reasons.append("search demand without dedicated content")
@@ -1742,32 +1705,81 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
 
         # Determine page type suggestion based on query intent
         query_lower = primary_query.lower()
+        intent_value = 0.5  # Default intent value
         if any(word in query_lower for word in ['how to', 'guide', 'tutorial', 'tips', 'steps']):
             page_type = 'Guide / How-To'
+            intent_value = 0.7
         elif any(word in query_lower for word in ['best', 'top', 'review', 'compare', 'vs']):
             page_type = 'Comparison / Review'
+            intent_value = 0.9
         elif any(word in query_lower for word in ['what is', 'meaning', 'definition', 'explain']):
             page_type = 'Educational / Explainer'
+            intent_value = 0.6
         elif any(word in query_lower for word in ['near me', 'in ', 'local']):
             page_type = 'Local Landing Page'
+            intent_value = 1.0
         elif any(word in query_lower for word in ['cost', 'price', 'pricing', 'quote', 'estimate']):
             page_type = 'Service / Pricing Page'
+            intent_value = 1.0
+        elif any(word in query_lower for word in ['buy', 'order', 'purchase', 'shop']):
+            page_type = 'Product / Service Page'
+            intent_value = 1.0
         else:
             page_type = 'Blog Post / Article'
+            intent_value = 0.5
 
         # Get secondary keywords (other queries in cluster)
         secondary = [q['query'] for q in cluster['queries'] if q['query'] != primary_query][:8]
 
-        # Calculate priority score
-        score = 0
-        score += min(5, cluster['total_impressions'] // 100)  # Up to 5 points for impressions
-        score += min(3, len(cluster['queries']))  # Up to 3 points for cluster size
-        if avg_position > 20:
-            score += 2  # Bonus for weak current ranking (more room to improve)
-        if num_urls > 2:
-            score += 2  # Bonus for split traffic (consolidation opportunity)
-        if cluster['total_clicks'] < 5 and cluster['total_impressions'] >= 50:
-            score += 2  # Bonus for intent mismatch
+        # =====================================================================
+        # PRIORITY SCORE CALCULATION (New Weighting)
+        # 40% Impressions, 25% Lack of dominant URL, 20% Position weakness, 15% Intent value
+        # =====================================================================
+
+        # Impressions score (40% weight) - normalized 0-10 scale
+        # Use log scale for more balanced scoring across different impression ranges
+        import math
+        impressions_score = min(10, math.log10(max(1, cluster['total_impressions'])) * 2.5)
+
+        # Lack of dominant URL score (25% weight) - 0-10 scale
+        # Higher score = no dominant page = better opportunity for new content
+        if num_urls == 0:
+            lack_dominant_score = 10  # No pages at all - perfect for new content
+        elif dominant_share < 0.40:
+            lack_dominant_score = 8  # Traffic highly fragmented - needs consolidation
+        elif dominant_share < 0.60:
+            lack_dominant_score = 5  # Moderate fragmentation
+        else:
+            lack_dominant_score = 2  # One page is dominant but weak (otherwise would be excluded)
+
+        # Position weakness score (20% weight) - 0-10 scale
+        # Higher score = weaker current ranking = more room to improve
+        if avg_position == 0 or num_urls == 0:
+            position_score = 10  # Not ranking at all
+        elif avg_position > 30:
+            position_score = 9
+        elif avg_position > 20:
+            position_score = 7
+        elif avg_position > 15:
+            position_score = 5
+        elif avg_position > 10:
+            position_score = 3
+        else:
+            position_score = 1
+
+        # Intent value score (15% weight) - already 0-1, scale to 0-10
+        intent_score = intent_value * 10
+
+        # Calculate weighted priority score (0-10 scale)
+        priority_score = (
+            (impressions_score * 0.40) +
+            (lack_dominant_score * 0.25) +
+            (position_score * 0.20) +
+            (intent_score * 0.15)
+        )
+
+        # Round to 1 decimal place
+        priority_score = round(priority_score, 1)
 
         topic_opportunities.append({
             'Suggested Topic': suggested_topic,
@@ -1775,9 +1787,10 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
             'Secondary Keywords': ', '.join(secondary) if secondary else '',
             'Total Impressions': cluster['total_impressions'],
             'Avg Position': round(avg_position, 1) if avg_position > 0 else 'N/A',
-            'Why This Content Is Needed': why_needed,
+            'Cannibalization Risk': cannibalization_risk if cannibalization_reason else cannibalization_risk,
+            'Why This Content Is Needed': why_needed if not cannibalization_reason else f"{why_needed} NOTE: {cannibalization_reason}",
             'Suggested Page Type': page_type,
-            'Priority Score': score
+            'Priority Score': priority_score
         })
 
     if not topic_opportunities:
@@ -1790,7 +1803,7 @@ def cluster_queries_into_topics(queries_df: pd.DataFrame, max_topics: int = 20) 
     return result
 
 
-def build_new_content_opportunities_sheet(df: pd.DataFrame, gsc_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+def build_new_content_opportunities_sheet(df: pd.DataFrame, gsc_df: Optional[pd.DataFrame] = None, thin_threshold: int = 1000) -> pd.DataFrame:
     """
     Build the 'New Content Opportunities' analytical sheet.
 
@@ -1802,25 +1815,48 @@ def build_new_content_opportunities_sheet(df: pd.DataFrame, gsc_df: Optional[pd.
     The approach:
     1. Analyze query-level GSC data (not aggregated URL data)
     2. Cluster similar queries into topic groups
-    3. Identify topics without dedicated landing pages
-    4. Output suggested topics for new content creation
+    3. Detect cannibalization - exclude topics where a strong page already exists
+    4. Flag cannibalization risks for topics with fragmented traffic
+    5. Output suggested topics for new content creation
 
     Args:
         df: Processed URL-level DataFrame with all metrics
         gsc_df: Raw GSC query-level data (before URL aggregation)
+        thin_threshold: Word count threshold for thin content identification
 
     Returns:
         DataFrame with new content TOPICS (not URLs), sorted by priority
     """
-    # Define output columns for empty result
+    # Define output columns for empty result (now includes Cannibalization Risk)
     empty_columns = [
         'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
-        'Avg Position', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
+        'Avg Position', 'Cannibalization Risk', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
     ]
 
     # If no GSC data, return empty with message
     if gsc_df is None or len(gsc_df) == 0:
         return pd.DataFrame(columns=empty_columns)
+
+    # Build set of thin content URLs for cannibalization checks
+    thin_urls = set()
+    if df is not None and len(df) > 0:
+        word_count_col = None
+        for col in ['word_count', 'Word Count', 'wordcount']:
+            if col in df.columns:
+                word_count_col = col
+                break
+
+        url_col = None
+        for col in ['url', 'URL', 'Address']:
+            if col in df.columns:
+                url_col = col
+                break
+
+        if word_count_col and url_col:
+            df_copy = df.copy()
+            df_copy[word_count_col] = pd.to_numeric(df_copy[word_count_col], errors='coerce').fillna(0)
+            thin_urls = set(df_copy[df_copy[word_count_col] < thin_threshold][url_col].tolist())
+            logger.debug(f"Identified {len(thin_urls)} thin content URLs for cannibalization checks")
 
     # Ensure GSC data has required columns
     gsc_copy = gsc_df.copy()
@@ -1842,6 +1878,18 @@ def build_new_content_opportunities_sheet(df: pd.DataFrame, gsc_df: Optional[pd.
     elif query_col != 'query':
         gsc_copy['query'] = gsc_copy[query_col]
 
+    # Ensure URL column exists for cannibalization detection
+    url_col = None
+    for col in ['url', 'URL', 'page', 'Page', 'landing_page']:
+        if col in gsc_copy.columns:
+            url_col = col
+            break
+
+    if url_col and url_col != 'url':
+        gsc_copy['url'] = gsc_copy[url_col]
+    elif url_col is None:
+        gsc_copy['url'] = ''  # No URL data available
+
     # Ensure numeric columns
     for col in ['impressions', 'clicks', 'avg_position']:
         if col not in gsc_copy.columns:
@@ -1854,8 +1902,8 @@ def build_new_content_opportunities_sheet(df: pd.DataFrame, gsc_df: Optional[pd.
     if len(qualifying_queries) == 0:
         return pd.DataFrame(columns=empty_columns)
 
-    # Cluster queries into topics
-    result = cluster_queries_into_topics(qualifying_queries, max_topics=20)
+    # Cluster queries into topics with cannibalization detection
+    result = cluster_queries_into_topics(qualifying_queries, max_topics=20, thin_urls=thin_urls)
 
     if len(result) == 0:
         return pd.DataFrame(columns=empty_columns)
@@ -1950,7 +1998,8 @@ def write_analytical_sheets(workbook, df: pd.DataFrame, thin_threshold: int = 10
     logger.info(f"Wrote Thin Content Opportunities sheet: {len(thin_df)} rows")
 
     # Sheet 3: New Content Opportunities (Topic-based, not URL-based)
-    new_content_df = build_new_content_opportunities_sheet(df, gsc_df)
+    # Pass thin_threshold for cannibalization detection
+    new_content_df = build_new_content_opportunities_sheet(df, gsc_df, thin_threshold)
     ws3 = workbook.create_sheet(title='New Content Opportunities')
 
     if len(new_content_df) > 0:
@@ -1963,15 +2012,16 @@ def write_analytical_sheets(workbook, df: pd.DataFrame, thin_threshold: int = 10
             for col_idx, value in enumerate(row, start=1):
                 ws3.cell(row=row_idx, column=col_idx, value=value)
 
-        # New column widths for topic-based structure
+        # Column widths for topic-based structure with cannibalization detection
         ws3.column_dimensions['A'].width = 35  # Suggested Topic
         ws3.column_dimensions['B'].width = 35  # Primary Keyword
         ws3.column_dimensions['C'].width = 60  # Secondary Keywords
         ws3.column_dimensions['D'].width = 16  # Total Impressions
         ws3.column_dimensions['E'].width = 12  # Avg Position
-        ws3.column_dimensions['F'].width = 70  # Why This Content Is Needed
-        ws3.column_dimensions['G'].width = 22  # Suggested Page Type
-        ws3.column_dimensions['H'].width = 14  # Priority Score
+        ws3.column_dimensions['F'].width = 20  # Cannibalization Risk
+        ws3.column_dimensions['G'].width = 80  # Why This Content Is Needed (includes cannibalization notes)
+        ws3.column_dimensions['H'].width = 22  # Suggested Page Type
+        ws3.column_dimensions['I'].width = 14  # Priority Score
     else:
         ws3.cell(row=1, column=1, value='No new content opportunities found (GSC query data required)')
 
@@ -1990,12 +2040,11 @@ def write_excel(
     """
     Write the processed data and summaries to an Excel file.
 
-    Creates eight sheets:
+    Creates seven sheets:
     - Aggregation: Full dataset with all columns
     - Actions: Filtered view with key columns, sorted by priority
     - Summary: Statistical summaries
     - Data Quality: Data quality issues and diagnostics (if provided)
-    - SEO Report Template: Blank template for manual month-over-month reporting
     - Content to Optimize: Top 20 pages with value but underperforming
     - Thin Content Opportunities: Pages lacking depth
     - New Content Opportunities: Topic-based content gaps (requires GSC query data)
@@ -2181,11 +2230,7 @@ def write_excel(
 
             logger.info(f"Wrote Data Quality sheet: {len(quality_report.issues)} issues found")
 
-        # Sheet 5: SEO Report Template (blank template for manual completion)
-        write_seo_report_template(writer.book)
-        logger.info("Wrote SEO Report Template sheet")
-
-        # Sheets 6-8: Analytical Insight Sheets
+        # Sheets 5-7: Analytical Insight Sheets
         write_analytical_sheets(writer.book, df, thin_content_threshold, gsc_df)
 
     logger.info(f"Excel report saved successfully: {output_path}")

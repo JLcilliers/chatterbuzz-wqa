@@ -158,9 +158,10 @@ def verify_analytical_sheets(excel_path: str) -> bool:
         print(f"  [OK] Sheet exists")
 
         # Check for expected headers (topic-based, not URL-based)
+        # Note: Cannibalization Risk column added between Avg Position and Why This Content Is Needed
         expected_headers = [
             'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
-            'Avg Position', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
+            'Avg Position', 'Cannibalization Risk', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
         ]
 
         # Check if sheet has data or the "no opportunities" message
