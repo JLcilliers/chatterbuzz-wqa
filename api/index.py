@@ -2672,6 +2672,8 @@ async def root():
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WQA Generator - Website Quality Audit</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/choices.js/public/assets/styles/choices.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/choices.js/public/assets/scripts/choices.min.js"></script>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -2786,6 +2788,22 @@ async def root():
         .api-selector.has-selection select { border-color: #27ae60; }
         .api-selector label { display: block; font-size: 0.85rem; color: #666; margin-bottom: 8px; }
         .loading-indicator { color: #666; font-style: italic; padding: 10px 0; }
+
+        /* Choices.js custom styling */
+        .choices { width: 100%; }
+        .choices__inner {
+            background: white; border: 2px solid #e0e0e0; border-radius: 8px;
+            padding: 10px 12px; min-height: 44px;
+        }
+        .choices__input { background: transparent; padding: 0; margin: 0; }
+        .choices[data-type*=select-one] .choices__inner { padding-bottom: 10px; }
+        .choices[data-type*=select-one] .choices__input { margin: 0; padding: 0; }
+        .choices__list--single { padding: 0; }
+        .choices__list--dropdown { border-radius: 8px; border: 2px solid #e0e0e0; margin-top: 4px; }
+        .choices__list--dropdown .choices__item--selectable.is-highlighted { background-color: #667eea; color: white; }
+        .choices__list--dropdown .choices__item { padding: 10px 12px; }
+        .choices__placeholder { color: #999; }
+        .choices.is-focused .choices__inner { border-color: #667eea; box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2); }
 
         .hidden { display: none !important; }
 
@@ -2968,6 +2986,46 @@ async def root():
         let ga4DataSource = 'csv';
         let gscDataSource = 'csv';
 
+        // Choices.js instances for searchable dropdowns
+        let ga4Choices = null;
+        let gscChoices = null;
+
+        function initSearchableDropdowns() {
+            // Initialize GA4 property dropdown with search
+            ga4Choices = new Choices('#ga4PropertySelect', {
+                searchEnabled: true,
+                searchPlaceholderValue: 'Type to search properties...',
+                itemSelectText: '',
+                noResultsText: 'No properties found',
+                noChoicesText: 'Connect Google first',
+                shouldSort: false,
+                searchResultLimit: 50,
+                placeholder: true,
+                placeholderValue: '-- Select GA4 Property --'
+            });
+
+            // Initialize GSC site dropdown with search
+            gscChoices = new Choices('#gscSiteSelect', {
+                searchEnabled: true,
+                searchPlaceholderValue: 'Type to search sites...',
+                itemSelectText: '',
+                noResultsText: 'No sites found',
+                noChoicesText: 'Connect Google first',
+                shouldSort: false,
+                searchResultLimit: 50,
+                placeholder: true,
+                placeholderValue: '-- Select GSC Site --'
+            });
+
+            // Add change event listeners for Choices.js
+            document.getElementById('ga4PropertySelect').addEventListener('change', function() {
+                document.getElementById('ga4PropertyId').value = this.value;
+            });
+            document.getElementById('gscSiteSelect').addEventListener('change', function() {
+                document.getElementById('gscSiteUrl').value = this.value;
+            });
+        }
+
         // Check auth status on page load
         async function checkAuthStatus() {
             try {
@@ -3012,31 +3070,37 @@ async def root():
         }
 
         async function loadGoogleData() {
-            // Load GA4 properties
+            // Load GA4 properties using Choices.js API
             try {
                 const ga4Response = await fetch('/api/ga4/properties');
                 if (ga4Response.ok) {
                     const ga4Data = await ga4Response.json();
-                    const select = document.getElementById('ga4PropertySelect');
-                    select.innerHTML = '<option value="">-- Select GA4 Property --</option>';
-                    ga4Data.properties.forEach(prop => {
-                        select.innerHTML += `<option value="${prop.id}">${prop.name} (${prop.account})</option>`;
-                    });
+                    if (ga4Choices) {
+                        ga4Choices.clearChoices();
+                        const choices = [{ value: '', label: '-- Select GA4 Property --', placeholder: true, disabled: true }];
+                        ga4Data.properties.forEach(prop => {
+                            choices.push({ value: prop.id, label: `${prop.name} (${prop.account})` });
+                        });
+                        ga4Choices.setChoices(choices, 'value', 'label', true);
+                    }
                 }
             } catch (error) {
                 console.error('Error loading GA4 properties:', error);
             }
 
-            // Load GSC sites
+            // Load GSC sites using Choices.js API
             try {
                 const gscResponse = await fetch('/api/gsc/sites');
                 if (gscResponse.ok) {
                     const gscData = await gscResponse.json();
-                    const select = document.getElementById('gscSiteSelect');
-                    select.innerHTML = '<option value="">-- Select GSC Site --</option>';
-                    gscData.sites.forEach(site => {
-                        select.innerHTML += `<option value="${site.url}">${site.url}</option>`;
-                    });
+                    if (gscChoices) {
+                        gscChoices.clearChoices();
+                        const choices = [{ value: '', label: '-- Select GSC Site --', placeholder: true, disabled: true }];
+                        gscData.sites.forEach(site => {
+                            choices.push({ value: site.url, label: site.url });
+                        });
+                        gscChoices.setChoices(choices, 'value', 'label', true);
+                    }
                 }
             } catch (error) {
                 console.error('Error loading GSC sites:', error);
@@ -3102,13 +3166,8 @@ async def root():
         setupFileInput('backlinkFile', 'backlinkBtn', 'backlinkFileName');
         setupFileInput('keywordFile', 'keywordBtn', 'keywordFileName');
 
-        // Update hidden fields when selectors change
-        document.getElementById('ga4PropertySelect').addEventListener('change', function() {
-            document.getElementById('ga4PropertyId').value = this.value;
-        });
-        document.getElementById('gscSiteSelect').addEventListener('change', function() {
-            document.getElementById('gscSiteUrl').value = this.value;
-        });
+        // Initialize searchable dropdowns for GA4/GSC
+        initSearchableDropdowns();
 
         // Form submission
         document.getElementById('wqaForm').addEventListener('submit', async function(e) {
