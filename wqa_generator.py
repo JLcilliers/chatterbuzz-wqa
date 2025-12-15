@@ -1344,27 +1344,534 @@ def write_seo_report_template(workbook) -> None:
     ws.freeze_panes = 'A8'
 
 
+# =============================================================================
+# ANALYTICAL INSIGHT SHEETS
+# =============================================================================
+
+def build_content_to_optimize_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the 'Content to Optimize' analytical sheet.
+
+    Identifies pages with value but underperforming that could benefit from
+    optimization. These are pages that have search visibility but aren't
+    converting that visibility into clicks efficiently.
+
+    Selection Criteria:
+    1. High impressions but low CTR (impressions >= 100 and CTR < 5%)
+    2. Ranking positions 5-20 (striking distance to page 1)
+    3. On-page issues (missing meta description, thin content, etc.)
+    4. Status code 200 (live pages only)
+    5. Indexable pages only
+
+    Args:
+        df: Processed URL-level DataFrame with all metrics
+
+    Returns:
+        DataFrame with content optimization opportunities, sorted by priority
+    """
+    # Filter to live, indexable pages
+    mask = (
+        (df['status_code'] == 200) &
+        (df['indexable'] == True)
+    )
+
+    candidates = df[mask].copy()
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Avg Position', 'Impressions', 'Clicks', 'CTR (%)',
+            'Word Count', 'Has Meta Description', 'Sessions', 'Optimization Signals', 'Priority Score'
+        ])
+
+    # Calculate optimization signals for each page
+    optimization_signals = []
+    priority_scores = []
+
+    for _, row in candidates.iterrows():
+        signals = []
+        score = 0
+
+        # Signal 1: High impressions, low CTR (CTR below 5% with significant impressions)
+        if row['impressions'] >= 100 and row['ctr'] < 0.05:
+            signals.append('Low CTR despite impressions')
+            score += 3
+        elif row['impressions'] >= 50 and row['ctr'] < 0.03:
+            signals.append('Very low CTR')
+            score += 4
+
+        # Signal 2: Striking distance (position 5-20)
+        if 5 <= row['avg_position'] <= 10:
+            signals.append('Position 5-10 (near page 1)')
+            score += 5
+        elif 11 <= row['avg_position'] <= 20:
+            signals.append('Position 11-20 (striking distance)')
+            score += 3
+
+        # Signal 3: Missing or thin meta description
+        meta_desc = str(row.get('meta_description', '')).strip()
+        if not meta_desc:
+            signals.append('Missing meta description')
+            score += 2
+        elif len(meta_desc) < 70:
+            signals.append('Short meta description')
+            score += 1
+
+        # Signal 4: Thin content (below 1000 words for substantial pages)
+        if row['word_count'] < 500:
+            signals.append('Very thin content (<500 words)')
+            score += 3
+        elif row['word_count'] < 1000:
+            signals.append('Thin content (<1000 words)')
+            score += 2
+
+        # Signal 5: Has traffic but could have more
+        if row['sessions'] > 0 and row['avg_position'] > 5:
+            signals.append('Has traffic, room to improve')
+            score += 1
+
+        # Signal 6: High impressions indicates search demand
+        if row['impressions'] >= 500:
+            signals.append('High search demand')
+            score += 2
+        elif row['impressions'] >= 100:
+            signals.append('Moderate search demand')
+            score += 1
+
+        optimization_signals.append('; '.join(signals) if signals else 'No specific signals')
+        priority_scores.append(score)
+
+    candidates['Optimization Signals'] = optimization_signals
+    candidates['Priority Score'] = priority_scores
+
+    # Filter to only pages with at least one optimization signal (score > 0)
+    candidates = candidates[candidates['Priority Score'] > 0]
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Avg Position', 'Impressions', 'Clicks', 'CTR (%)',
+            'Word Count', 'Has Meta Description', 'Sessions', 'Optimization Signals', 'Priority Score'
+        ])
+
+    # Sort by priority score descending
+    candidates = candidates.sort_values('Priority Score', ascending=False)
+
+    # Build output DataFrame with selected columns
+    result = pd.DataFrame({
+        'URL': candidates['url'],
+        'Page Type': candidates['page_type'],
+        'Avg Position': candidates['avg_position'].round(1),
+        'Impressions': candidates['impressions'].astype(int),
+        'Clicks': candidates['clicks'].astype(int),
+        'CTR (%)': (candidates['ctr'] * 100).round(2),
+        'Word Count': candidates['word_count'].astype(int),
+        'Has Meta Description': candidates['meta_description'].apply(lambda x: 'Yes' if str(x).strip() else 'No'),
+        'Sessions': candidates['sessions'].astype(int),
+        'Optimization Signals': candidates['Optimization Signals'],
+        'Priority Score': candidates['Priority Score']
+    })
+
+    return result
+
+
+def build_thin_content_sheet(df: pd.DataFrame, thin_threshold: int = 1000) -> pd.DataFrame:
+    """
+    Build the 'Thin Content Opportunities' analytical sheet.
+
+    Identifies pages lacking depth that could benefit from content expansion.
+    These are indexable pages with low word counts that have some search
+    visibility or traffic potential.
+
+    Selection Criteria:
+    1. Word count below threshold (default 1000 words)
+    2. Page is indexable and status 200
+    3. Has some value signal (impressions, sessions, or backlinks)
+    4. Not already flagged for deletion
+
+    Args:
+        df: Processed URL-level DataFrame with all metrics
+        thin_threshold: Word count threshold for thin content (default 1000)
+
+    Returns:
+        DataFrame with thin content opportunities, sorted by potential value
+    """
+    # Filter to live, indexable pages with thin content
+    mask = (
+        (df['status_code'] == 200) &
+        (df['indexable'] == True) &
+        (df['word_count'] < thin_threshold)
+    )
+
+    candidates = df[mask].copy()
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Word Count', 'Content Gap', 'Sessions',
+            'Impressions', 'Avg Position', 'Referring Domains', 'Opportunity Type', 'Value Score'
+        ])
+
+    # Calculate value score and opportunity type
+    opportunity_types = []
+    value_scores = []
+
+    for _, row in candidates.iterrows():
+        opp_type = []
+        score = 0
+
+        # Value from traffic
+        if row['sessions'] >= 10:
+            opp_type.append('Has significant traffic')
+            score += 5
+        elif row['sessions'] > 0:
+            opp_type.append('Has some traffic')
+            score += 2
+
+        # Value from search visibility
+        if row['impressions'] >= 100:
+            opp_type.append('High search visibility')
+            score += 4
+        elif row['impressions'] > 0:
+            opp_type.append('Some search visibility')
+            score += 1
+
+        # Value from rankings (already ranking = easier to improve)
+        if 0 < row['avg_position'] <= 20:
+            opp_type.append('Already ranking (pos <= 20)')
+            score += 3
+        elif 20 < row['avg_position'] <= 50:
+            opp_type.append('Has rankings (pos 20-50)')
+            score += 1
+
+        # Value from backlinks (has authority)
+        if row['referring_domains'] >= 5:
+            opp_type.append('Strong backlink profile')
+            score += 4
+        elif row['referring_domains'] > 0:
+            opp_type.append('Has backlinks')
+            score += 2
+
+        # Strategic page types get bonus
+        if row['page_type'] in ['Service', 'Local Lander', 'Home']:
+            opp_type.append(f'Strategic page ({row["page_type"]})')
+            score += 3
+
+        # Very thin content penalty/opportunity marker
+        if row['word_count'] < 300:
+            opp_type.append('Severely thin (<300 words)')
+        elif row['word_count'] < 500:
+            opp_type.append('Very thin (<500 words)')
+
+        opportunity_types.append('; '.join(opp_type) if opp_type else 'Low priority')
+        value_scores.append(score)
+
+    candidates['Opportunity Type'] = opportunity_types
+    candidates['Value Score'] = value_scores
+
+    # Filter to pages with some value signal (score > 0)
+    candidates = candidates[candidates['Value Score'] > 0]
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Word Count', 'Content Gap', 'Sessions',
+            'Impressions', 'Avg Position', 'Referring Domains', 'Opportunity Type', 'Value Score'
+        ])
+
+    # Sort by value score descending
+    candidates = candidates.sort_values('Value Score', ascending=False)
+
+    # Calculate content gap (words needed to reach threshold)
+    content_gap = thin_threshold - candidates['word_count']
+
+    # Build output DataFrame
+    result = pd.DataFrame({
+        'URL': candidates['url'],
+        'Page Type': candidates['page_type'],
+        'Word Count': candidates['word_count'].astype(int),
+        'Content Gap': content_gap.astype(int),
+        'Sessions': candidates['sessions'].astype(int),
+        'Impressions': candidates['impressions'].astype(int),
+        'Avg Position': candidates['avg_position'].round(1),
+        'Referring Domains': candidates['referring_domains'].astype(int),
+        'Opportunity Type': candidates['Opportunity Type'],
+        'Value Score': candidates['Value Score']
+    })
+
+    return result
+
+
+def build_new_content_opportunities_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the 'New Content Opportunities' analytical sheet.
+
+    Identifies content gaps - areas where there's search demand but no
+    strong landing page exists, or where new content could capture
+    additional traffic.
+
+    Selection Criteria:
+    1. Pages with high impressions but very low/no clicks (unmet demand)
+    2. Pages with backlinks but no organic traffic (wasted authority)
+    3. High-value page types without sufficient content
+    4. Keywords ranking 20-100 that could benefit from dedicated content
+
+    Args:
+        df: Processed URL-level DataFrame with all metrics
+
+    Returns:
+        DataFrame with new content opportunities, sorted by potential value
+    """
+    # We'll identify several types of opportunities
+    opportunities = []
+
+    # Opportunity Type 1: High impressions, very low clicks (content not matching intent)
+    intent_mismatch = df[
+        (df['status_code'] == 200) &
+        (df['impressions'] >= 100) &
+        (df['clicks'] < 5) &
+        (df['ctr'] < 0.02)
+    ].copy()
+
+    for _, row in intent_mismatch.iterrows():
+        opportunities.append({
+            'URL': row['url'],
+            'Page Type': row['page_type'],
+            'Primary Keyword': row.get('primary_keyword', ''),
+            'Impressions': int(row['impressions']),
+            'Clicks': int(row['clicks']),
+            'Avg Position': round(row['avg_position'], 1),
+            'Sessions': int(row['sessions']),
+            'Referring Domains': int(row['referring_domains']),
+            'Opportunity Type': 'Intent mismatch - create better content for query',
+            'Value Score': min(10, int(row['impressions'] / 50) + 3)
+        })
+
+    # Opportunity Type 2: Pages with backlinks but no organic traffic (wasted authority)
+    wasted_authority = df[
+        (df['status_code'] == 200) &
+        (df['referring_domains'] >= 3) &
+        (df['sessions'] == 0) &
+        (df['impressions'] < 50)
+    ].copy()
+
+    for _, row in wasted_authority.iterrows():
+        opportunities.append({
+            'URL': row['url'],
+            'Page Type': row['page_type'],
+            'Primary Keyword': row.get('primary_keyword', ''),
+            'Impressions': int(row['impressions']),
+            'Clicks': int(row['clicks']),
+            'Avg Position': round(row['avg_position'], 1),
+            'Sessions': int(row['sessions']),
+            'Referring Domains': int(row['referring_domains']),
+            'Opportunity Type': 'Wasted authority - optimize or redirect',
+            'Value Score': min(10, int(row['referring_domains']) + 2)
+        })
+
+    # Opportunity Type 3: Pages ranking 20-50 with keyword (could create dedicated content)
+    deep_rankings = df[
+        (df['status_code'] == 200) &
+        (df['avg_position'] > 20) &
+        (df['avg_position'] <= 50) &
+        (df['impressions'] >= 50)
+    ].copy()
+
+    for _, row in deep_rankings.iterrows():
+        keyword = str(row.get('primary_keyword', '')).strip()
+        if keyword:
+            opportunities.append({
+                'URL': row['url'],
+                'Page Type': row['page_type'],
+                'Primary Keyword': keyword,
+                'Impressions': int(row['impressions']),
+                'Clicks': int(row['clicks']),
+                'Avg Position': round(row['avg_position'], 1),
+                'Sessions': int(row['sessions']),
+                'Referring Domains': int(row['referring_domains']),
+                'Opportunity Type': f'Create dedicated content for: {keyword[:50]}',
+                'Value Score': max(1, 8 - int((row['avg_position'] - 20) / 5))
+            })
+
+    # Opportunity Type 4: Strategic pages (Service/Local) with very thin content and no traffic
+    strategic_gaps = df[
+        (df['status_code'] == 200) &
+        (df['page_type'].isin(['Service', 'Local Lander'])) &
+        (df['word_count'] < 500) &
+        (df['sessions'] == 0)
+    ].copy()
+
+    for _, row in strategic_gaps.iterrows():
+        opportunities.append({
+            'URL': row['url'],
+            'Page Type': row['page_type'],
+            'Primary Keyword': row.get('primary_keyword', ''),
+            'Impressions': int(row['impressions']),
+            'Clicks': int(row['clicks']),
+            'Avg Position': round(row['avg_position'], 1),
+            'Sessions': int(row['sessions']),
+            'Referring Domains': int(row['referring_domains']),
+            'Opportunity Type': f'Strategic page needs content ({row["page_type"]})',
+            'Value Score': 6
+        })
+
+    if not opportunities:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Primary Keyword', 'Impressions', 'Clicks',
+            'Avg Position', 'Sessions', 'Referring Domains', 'Opportunity Type', 'Value Score'
+        ])
+
+    # Create DataFrame and deduplicate (same URL might appear in multiple categories)
+    result = pd.DataFrame(opportunities)
+
+    # Keep the highest value score for each URL
+    result = result.sort_values('Value Score', ascending=False)
+    result = result.drop_duplicates(subset=['URL'], keep='first')
+
+    # Sort by value score
+    result = result.sort_values('Value Score', ascending=False)
+
+    return result
+
+
+def write_analytical_sheets(workbook, df: pd.DataFrame, thin_threshold: int = 1000) -> None:
+    """
+    Write all analytical insight sheets to the workbook.
+
+    Creates three sheets:
+    - Content to Optimize: Pages with value but underperforming
+    - Thin Content Opportunities: Pages lacking depth
+    - New Content Opportunities: Content gaps and new content ideas
+
+    Args:
+        workbook: openpyxl Workbook object
+        df: Processed URL-level DataFrame
+        thin_threshold: Word count threshold for thin content
+    """
+    from openpyxl.styles import PatternFill
+    from openpyxl.utils.dataframe import dataframe_to_rows
+
+    # Define header style
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+
+    # Sheet 1: Content to Optimize
+    content_df = build_content_to_optimize_sheet(df)
+    ws1 = workbook.create_sheet(title='Content to Optimize')
+
+    # Write header
+    if len(content_df) > 0:
+        for col_idx, col_name in enumerate(content_df.columns, start=1):
+            cell = ws1.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        # Write data
+        for row_idx, row in enumerate(content_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws1.cell(row=row_idx, column=col_idx, value=value)
+
+        # Set column widths
+        ws1.column_dimensions['A'].width = 60  # URL
+        ws1.column_dimensions['B'].width = 15  # Page Type
+        ws1.column_dimensions['C'].width = 12  # Avg Position
+        ws1.column_dimensions['D'].width = 12  # Impressions
+        ws1.column_dimensions['E'].width = 10  # Clicks
+        ws1.column_dimensions['F'].width = 10  # CTR
+        ws1.column_dimensions['G'].width = 12  # Word Count
+        ws1.column_dimensions['H'].width = 18  # Has Meta Desc
+        ws1.column_dimensions['I'].width = 10  # Sessions
+        ws1.column_dimensions['J'].width = 50  # Optimization Signals
+        ws1.column_dimensions['K'].width = 14  # Priority Score
+    else:
+        ws1.cell(row=1, column=1, value='No content optimization opportunities found')
+
+    ws1.freeze_panes = 'A2'
+    logger.info(f"Wrote Content to Optimize sheet: {len(content_df)} rows")
+
+    # Sheet 2: Thin Content Opportunities
+    thin_df = build_thin_content_sheet(df, thin_threshold)
+    ws2 = workbook.create_sheet(title='Thin Content Opportunities')
+
+    if len(thin_df) > 0:
+        for col_idx, col_name in enumerate(thin_df.columns, start=1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        for row_idx, row in enumerate(thin_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws2.cell(row=row_idx, column=col_idx, value=value)
+
+        ws2.column_dimensions['A'].width = 60  # URL
+        ws2.column_dimensions['B'].width = 15  # Page Type
+        ws2.column_dimensions['C'].width = 12  # Word Count
+        ws2.column_dimensions['D'].width = 12  # Content Gap
+        ws2.column_dimensions['E'].width = 10  # Sessions
+        ws2.column_dimensions['F'].width = 12  # Impressions
+        ws2.column_dimensions['G'].width = 12  # Avg Position
+        ws2.column_dimensions['H'].width = 16  # Referring Domains
+        ws2.column_dimensions['I'].width = 50  # Opportunity Type
+        ws2.column_dimensions['J'].width = 12  # Value Score
+    else:
+        ws2.cell(row=1, column=1, value='No thin content opportunities found')
+
+    ws2.freeze_panes = 'A2'
+    logger.info(f"Wrote Thin Content Opportunities sheet: {len(thin_df)} rows")
+
+    # Sheet 3: New Content Opportunities
+    new_content_df = build_new_content_opportunities_sheet(df)
+    ws3 = workbook.create_sheet(title='New Content Opportunities')
+
+    if len(new_content_df) > 0:
+        for col_idx, col_name in enumerate(new_content_df.columns, start=1):
+            cell = ws3.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+
+        for row_idx, row in enumerate(new_content_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws3.cell(row=row_idx, column=col_idx, value=value)
+
+        ws3.column_dimensions['A'].width = 60  # URL
+        ws3.column_dimensions['B'].width = 15  # Page Type
+        ws3.column_dimensions['C'].width = 30  # Primary Keyword
+        ws3.column_dimensions['D'].width = 12  # Impressions
+        ws3.column_dimensions['E'].width = 10  # Clicks
+        ws3.column_dimensions['F'].width = 12  # Avg Position
+        ws3.column_dimensions['G'].width = 10  # Sessions
+        ws3.column_dimensions['H'].width = 16  # Referring Domains
+        ws3.column_dimensions['I'].width = 50  # Opportunity Type
+        ws3.column_dimensions['J'].width = 12  # Value Score
+    else:
+        ws3.cell(row=1, column=1, value='No new content opportunities found')
+
+    ws3.freeze_panes = 'A2'
+    logger.info(f"Wrote New Content Opportunities sheet: {len(new_content_df)} rows")
+
+
 def write_excel(
     df: pd.DataFrame,
     summaries: Dict[str, pd.DataFrame],
     output_path: str,
-    quality_report: Optional[DataQualityReport] = None
+    quality_report: Optional[DataQualityReport] = None,
+    thin_content_threshold: int = 1000
 ) -> None:
     """
     Write the processed data and summaries to an Excel file.
 
-    Creates five sheets:
+    Creates eight sheets:
     - Aggregation: Full dataset with all columns
     - Actions: Filtered view with key columns, sorted by priority
     - Summary: Statistical summaries
     - Data Quality: Data quality issues and diagnostics (if provided)
     - SEO Report Template: Blank template for manual month-over-month reporting
+    - Content to Optimize: Pages with value but underperforming
+    - Thin Content Opportunities: Pages lacking depth
+    - New Content Opportunities: Content gaps and new content ideas
 
     Args:
         df: Processed URL-level DataFrame
         summaries: Dictionary of summary DataFrames
         output_path: Path to output Excel file
         quality_report: Optional DataQualityReport with validation results
+        thin_content_threshold: Word count threshold for thin content analysis
     """
     logger.info(f"Writing Excel report to: {output_path}")
 
@@ -1543,6 +2050,9 @@ def write_excel(
         write_seo_report_template(writer.book)
         logger.info("Wrote SEO Report Template sheet")
 
+        # Sheets 6-8: Analytical Insight Sheets
+        write_analytical_sheets(writer.book, df, thin_content_threshold)
+
     logger.info(f"Excel report saved successfully: {output_path}")
 
 
@@ -1626,7 +2136,7 @@ def main() -> int:
         quality_report = validate_data_quality(df, crawl_df, ga_df, gsc_df, backlink_df)
 
         # Write output
-        write_excel(df, summaries, args.output, quality_report)
+        write_excel(df, summaries, args.output, quality_report, args.thin_content_threshold)
 
         # Log summary of data quality issues
         high_issues = sum(1 for i in quality_report.issues if i['severity'] == 'High')
