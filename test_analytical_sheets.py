@@ -90,9 +90,15 @@ def verify_analytical_sheets(excel_path: str) -> bool:
             else:
                 print(f"  [OK] Freeze panes at A2")
 
-            # Count data rows
+            # Count data rows (should be capped at max 20)
             row_count = ws.max_row - 1  # Exclude header
             print(f"  [OK] Data rows: {row_count}")
+
+            # Verify Top 20 cap
+            if row_count > 20:
+                errors.append(f"  {sheet_name}: Expected max 20 rows, got {row_count}")
+            else:
+                print(f"  [OK] Row count within Top 20 cap")
 
     print()
 
@@ -151,15 +157,15 @@ def verify_analytical_sheets(excel_path: str) -> bool:
         ws = wb[sheet_name]
         print(f"  [OK] Sheet exists")
 
-        # Check for expected headers
+        # Check for expected headers (topic-based, not URL-based)
         expected_headers = [
-            'URL', 'Page Type', 'Primary Keyword', 'Impressions', 'Clicks',
-            'Avg Position', 'Sessions', 'Referring Domains', 'Opportunity Type', 'Value Score'
+            'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
+            'Avg Position', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
         ]
 
         # Check if sheet has data or the "no opportunities" message
         first_cell = ws.cell(row=1, column=1).value
-        if first_cell == 'No new content opportunities found':
+        if first_cell == 'No new content topic opportunities found':
             print(f"  [OK] Sheet has 'no opportunities' message (data-dependent)")
         else:
             # Check headers
@@ -176,9 +182,21 @@ def verify_analytical_sheets(excel_path: str) -> bool:
             else:
                 print(f"  [OK] Freeze panes at A2")
 
-            # Count data rows
+            # Count data rows (topic-based sheet, capped at 20)
             row_count = ws.max_row - 1  # Exclude header
             print(f"  [OK] Data rows: {row_count}")
+
+            # Verify Top 20 cap
+            if row_count > 20:
+                errors.append(f"  {sheet_name}: Expected max 20 topics, got {row_count}")
+            else:
+                print(f"  [OK] Row count within Top 20 cap")
+
+            # Verify no URL column exists (should be topic-based, not URL-based)
+            for col_idx in range(1, ws.max_column + 1):
+                header = ws.cell(row=1, column=col_idx).value
+                if header and 'URL' in str(header).upper():
+                    errors.append(f"  {sheet_name}: Found URL column '{header}' - sheet should be topic-based, not URL-based")
 
     print()
 

@@ -1527,7 +1527,8 @@ def build_content_to_optimize_api(df: pd.DataFrame) -> pd.DataFrame:
             'Word Count', 'Has Meta Description', 'Sessions', 'Optimization Signals', 'Priority Score'
         ])
 
-    candidates = candidates.sort_values('Priority Score', ascending=False)
+    # Sort by priority score descending and cap at top 20
+    candidates = candidates.sort_values('Priority Score', ascending=False).head(20)
 
     return pd.DataFrame({
         'URL': candidates['url'],
@@ -1629,73 +1630,204 @@ def build_thin_content_api(df: pd.DataFrame, thin_threshold: int = 1000) -> pd.D
     })
 
 
-def build_new_content_opportunities_api(df: pd.DataFrame) -> pd.DataFrame:
-    """Build New Content Opportunities sheet - API version."""
-    opportunities = []
+def cluster_queries_into_topics_api(queries_df: pd.DataFrame, max_topics: int = 20) -> pd.DataFrame:
+    """
+    Cluster similar queries into topic groups for new content opportunities.
+    API version - uses simple word-overlap algorithm.
+    """
+    import re
 
-    # Intent mismatch
-    intent_mismatch = df[(df['status_code'] == 200) & (df['impressions'] >= 100) & (df['clicks'] < 5) & (df['ctr'] < 0.02)].copy()
-    for _, row in intent_mismatch.iterrows():
-        opportunities.append({
-            'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': row.get('primary_keyword', ''),
-            'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
-            'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
-            'Referring Domains': int(row['referring_domains']),
-            'Opportunity Type': 'Intent mismatch - create better content for query',
-            'Value Score': min(10, int(row['impressions'] / 50) + 3)
-        })
+    if queries_df is None or len(queries_df) == 0:
+        return pd.DataFrame()
 
-    # Wasted authority
-    wasted_authority = df[(df['status_code'] == 200) & (df['referring_domains'] >= 3) & (df['sessions'] == 0) & (df['impressions'] < 50)].copy()
-    for _, row in wasted_authority.iterrows():
-        opportunities.append({
-            'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': row.get('primary_keyword', ''),
-            'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
-            'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
-            'Referring Domains': int(row['referring_domains']),
-            'Opportunity Type': 'Wasted authority - optimize or redirect',
-            'Value Score': min(10, int(row['referring_domains']) + 2)
-        })
+    def tokenize(query):
+        query = str(query).lower().strip()
+        stopwords = {'a', 'an', 'the', 'in', 'on', 'at', 'to', 'for', 'of', 'and', 'or', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'with', 'as', 'by', 'from', 'how', 'when', 'where', 'why', 'if', 'then', 'so', 'than', 'too', 'very', 'just', 'only', 'also', 'even', 'more', 'most', 'other', 'into', 'over', 'after', 'before', 'between', 'through', 'during', 'under', 'around', 'about', 'near'}
+        words = re.findall(r'\b[a-z]{2,}\b', query)
+        return [w for w in words if w not in stopwords]
 
-    # Deep rankings
-    deep_rankings = df[(df['status_code'] == 200) & (df['avg_position'] > 20) & (df['avg_position'] <= 50) & (df['impressions'] >= 50)].copy()
-    for _, row in deep_rankings.iterrows():
-        keyword = str(row.get('primary_keyword', '')).strip()
-        if keyword:
-            opportunities.append({
-                'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': keyword,
-                'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
-                'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
-                'Referring Domains': int(row['referring_domains']),
-                'Opportunity Type': f'Create dedicated content for: {keyword[:50]}',
-                'Value Score': max(1, 8 - int((row['avg_position'] - 20) / 5))
+    query_data = []
+    for _, row in queries_df.iterrows():
+        query = str(row.get('query', row.get('primary_keyword', ''))).strip()
+        if not query or query == 'nan':
+            continue
+        tokens = tokenize(query)
+        if tokens:
+            query_data.append({
+                'query': query, 'tokens': set(tokens),
+                'impressions': int(row.get('impressions', 0)),
+                'clicks': int(row.get('clicks', 0)),
+                'avg_position': float(row.get('avg_position', 0)),
+                'url': str(row.get('url', ''))
             })
 
-    # Strategic gaps
-    strategic_gaps = df[(df['status_code'] == 200) & (df['page_type'].isin(['Service', 'Local Lander'])) & (df['word_count'] < 500) & (df['sessions'] == 0)].copy()
-    for _, row in strategic_gaps.iterrows():
-        opportunities.append({
-            'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': row.get('primary_keyword', ''),
-            'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
-            'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
-            'Referring Domains': int(row['referring_domains']),
-            'Opportunity Type': f'Strategic page needs content ({row["page_type"]})',
-            'Value Score': 6
+    if not query_data:
+        return pd.DataFrame()
+
+    query_data.sort(key=lambda x: x['impressions'], reverse=True)
+
+    clusters = []
+    used_queries = set()
+
+    for seed in query_data:
+        if seed['query'] in used_queries:
+            continue
+
+        cluster = {
+            'primary_query': seed['query'], 'queries': [seed],
+            'all_tokens': seed['tokens'].copy(),
+            'total_impressions': seed['impressions'], 'total_clicks': seed['clicks'],
+            'positions': [seed['avg_position']] if seed['avg_position'] > 0 else [],
+            'urls': {seed['url']} if seed['url'] else set()
+        }
+        used_queries.add(seed['query'])
+
+        for candidate in query_data:
+            if candidate['query'] in used_queries:
+                continue
+            overlap = len(seed['tokens'] & candidate['tokens'])
+            min_len = min(len(seed['tokens']), len(candidate['tokens']))
+            if min_len > 0 and overlap / min_len >= 0.5:
+                cluster['queries'].append(candidate)
+                cluster['all_tokens'].update(candidate['tokens'])
+                cluster['total_impressions'] += candidate['impressions']
+                cluster['total_clicks'] += candidate['clicks']
+                if candidate['avg_position'] > 0:
+                    cluster['positions'].append(candidate['avg_position'])
+                if candidate['url']:
+                    cluster['urls'].add(candidate['url'])
+                used_queries.add(candidate['query'])
+
+        clusters.append(cluster)
+
+    topic_opportunities = []
+    for cluster in clusters:
+        if len(cluster['queries']) == 1 and cluster['total_impressions'] < 100:
+            continue
+
+        if cluster['positions']:
+            weighted_pos = sum(q['avg_position'] * q['impressions'] for q in cluster['queries'] if q['avg_position'] > 0)
+            total_weight = sum(q['impressions'] for q in cluster['queries'] if q['avg_position'] > 0)
+            avg_position = weighted_pos / total_weight if total_weight > 0 else 0
+        else:
+            avg_position = 0
+
+        num_urls = len(cluster['urls'])
+        primary_query = cluster['primary_query']
+
+        reasons = []
+        if num_urls == 0:
+            reasons.append("no landing page exists for these queries")
+        elif num_urls > 2:
+            reasons.append("traffic is split across multiple pages")
+        if avg_position > 15:
+            reasons.append(f"current ranking is weak (avg position {avg_position:.0f})")
+        if cluster['total_impressions'] >= 100 and cluster['total_clicks'] < 10:
+            reasons.append("high impressions but very few clicks")
+        if not reasons:
+            reasons.append("search demand without dedicated content")
+
+        why_needed = f"These queries receive {cluster['total_impressions']:,} impressions but {'; '.join(reasons)}, indicating an opportunity for new content."
+
+        common_tokens = sorted(cluster['all_tokens'], key=lambda t: sum(1 for q in cluster['queries'] if t in q['tokens']), reverse=True)
+        suggested_topic = ' '.join(common_tokens[:4]).title() if common_tokens else primary_query.title()
+
+        query_lower = primary_query.lower()
+        if any(word in query_lower for word in ['how to', 'guide', 'tutorial', 'tips', 'steps']):
+            page_type = 'Guide / How-To'
+        elif any(word in query_lower for word in ['best', 'top', 'review', 'compare', 'vs']):
+            page_type = 'Comparison / Review'
+        elif any(word in query_lower for word in ['what is', 'meaning', 'definition', 'explain']):
+            page_type = 'Educational / Explainer'
+        elif any(word in query_lower for word in ['near me', 'in ', 'local']):
+            page_type = 'Local Landing Page'
+        elif any(word in query_lower for word in ['cost', 'price', 'pricing', 'quote', 'estimate']):
+            page_type = 'Service / Pricing Page'
+        else:
+            page_type = 'Blog Post / Article'
+
+        secondary = [q['query'] for q in cluster['queries'] if q['query'] != primary_query][:8]
+
+        score = 0
+        score += min(5, cluster['total_impressions'] // 100)
+        score += min(3, len(cluster['queries']))
+        if avg_position > 20:
+            score += 2
+        if num_urls > 2:
+            score += 2
+        if cluster['total_clicks'] < 5 and cluster['total_impressions'] >= 50:
+            score += 2
+
+        topic_opportunities.append({
+            'Suggested Topic': suggested_topic,
+            'Primary Keyword': primary_query,
+            'Secondary Keywords': ', '.join(secondary) if secondary else '',
+            'Total Impressions': cluster['total_impressions'],
+            'Avg Position': round(avg_position, 1) if avg_position > 0 else 'N/A',
+            'Why This Content Is Needed': why_needed,
+            'Suggested Page Type': page_type,
+            'Priority Score': score
         })
 
-    if not opportunities:
-        return pd.DataFrame(columns=[
-            'URL', 'Page Type', 'Primary Keyword', 'Impressions', 'Clicks',
-            'Avg Position', 'Sessions', 'Referring Domains', 'Opportunity Type', 'Value Score'
-        ])
+    if not topic_opportunities:
+        return pd.DataFrame()
 
-    result = pd.DataFrame(opportunities)
-    result = result.sort_values('Value Score', ascending=False)
-    result = result.drop_duplicates(subset=['URL'], keep='first')
-    return result.sort_values('Value Score', ascending=False)
+    result = pd.DataFrame(topic_opportunities)
+    return result.sort_values('Priority Score', ascending=False).head(max_topics)
 
 
-def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_threshold: int = 1000) -> None:
+def build_new_content_opportunities_api(df: pd.DataFrame, gsc_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """
+    Build New Content Opportunities sheet - API version.
+
+    Returns TOPICS (not URLs) derived from query-level GSC data.
+    This sheet answers: "What should we write that doesn't exist on the site yet?"
+    """
+    empty_columns = [
+        'Suggested Topic', 'Primary Keyword', 'Secondary Keywords', 'Total Impressions',
+        'Avg Position', 'Why This Content Is Needed', 'Suggested Page Type', 'Priority Score'
+    ]
+
+    if gsc_df is None or len(gsc_df) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    gsc_copy = gsc_df.copy()
+
+    # Map column names if needed
+    query_col = None
+    for col in ['query', 'primary_keyword', 'Query', 'Keyword', 'Top queries']:
+        if col in gsc_copy.columns:
+            query_col = col
+            break
+
+    if query_col is None:
+        if 'primary_keyword' in gsc_copy.columns:
+            gsc_copy['query'] = gsc_copy['primary_keyword']
+        else:
+            logger.warning("GSC data missing query column - cannot build topic-based opportunities")
+            return pd.DataFrame(columns=empty_columns)
+    elif query_col != 'query':
+        gsc_copy['query'] = gsc_copy[query_col]
+
+    for col in ['impressions', 'clicks', 'avg_position']:
+        if col not in gsc_copy.columns:
+            gsc_copy[col] = 0
+        gsc_copy[col] = pd.to_numeric(gsc_copy[col], errors='coerce').fillna(0)
+
+    qualifying_queries = gsc_copy[gsc_copy['impressions'] >= 10].copy()
+
+    if len(qualifying_queries) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    result = cluster_queries_into_topics_api(qualifying_queries, max_topics=20)
+
+    if len(result) == 0:
+        return pd.DataFrame(columns=empty_columns)
+
+    return result
+
+
+def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_threshold: int = 1000, gsc_df: Optional[pd.DataFrame] = None) -> None:
     """Write analytical insight sheets to workbook - API version."""
     from openpyxl.styles import Font, PatternFill
 
@@ -1740,8 +1872,8 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
     ws2.freeze_panes = 'A2'
     logger.info(f"Wrote Thin Content Opportunities sheet: {len(thin_df)} rows")
 
-    # Sheet 3: New Content Opportunities
-    new_content_df = build_new_content_opportunities_api(df)
+    # Sheet 3: New Content Opportunities (Topic-based, not URL-based)
+    new_content_df = build_new_content_opportunities_api(df, gsc_df)
     ws3 = workbook.create_sheet(title='New Content Opportunities')
 
     if len(new_content_df) > 0:
@@ -1752,18 +1884,26 @@ def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_thresho
         for row_idx, row in enumerate(new_content_df.itertuples(index=False), start=2):
             for col_idx, value in enumerate(row, start=1):
                 ws3.cell(row=row_idx, column=col_idx, value=value)
-        ws3.column_dimensions['A'].width = 60
-        ws3.column_dimensions['I'].width = 50
+        # New column widths for topic-based structure
+        ws3.column_dimensions['A'].width = 35  # Suggested Topic
+        ws3.column_dimensions['B'].width = 35  # Primary Keyword
+        ws3.column_dimensions['C'].width = 60  # Secondary Keywords
+        ws3.column_dimensions['D'].width = 16  # Total Impressions
+        ws3.column_dimensions['E'].width = 12  # Avg Position
+        ws3.column_dimensions['F'].width = 70  # Why This Content Is Needed
+        ws3.column_dimensions['G'].width = 22  # Suggested Page Type
+        ws3.column_dimensions['H'].width = 14  # Priority Score
     else:
-        ws3.cell(row=1, column=1, value='No new content opportunities found')
+        ws3.cell(row=1, column=1, value='No new content opportunities found (GSC query data required)')
     ws3.freeze_panes = 'A2'
-    logger.info(f"Wrote New Content Opportunities sheet: {len(new_content_df)} rows")
+    logger.info(f"Wrote New Content Opportunities sheet: {len(new_content_df)} topics")
 
 
 def create_excel_report(
     df: pd.DataFrame,
     summaries: Dict[str, pd.DataFrame],
-    quality_report: Optional[DataQualityReport] = None
+    quality_report: Optional[DataQualityReport] = None,
+    gsc_df: Optional[pd.DataFrame] = None
 ) -> bytes:
     """Create WQA Excel report with proper 3-header-row structure and data quality sheet"""
     output = io.BytesIO()
@@ -2119,7 +2259,7 @@ def create_excel_report(
         logger.info("Wrote SEO Report Template sheet")
 
         # Sheets 6-8: Analytical Insight Sheets
-        write_analytical_sheets_api(workbook, df, thin_content_threshold=1000)
+        write_analytical_sheets_api(workbook, df, thin_content_threshold=1000, gsc_df=gsc_df)
 
     output.seek(0)
     return output.getvalue()
