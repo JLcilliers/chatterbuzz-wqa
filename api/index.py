@@ -1413,6 +1413,353 @@ def format_indexability(row) -> Tuple[str, str]:
     return index_label, status_reason
 
 
+# =============================================================================
+# SEO REPORT TEMPLATE AND ANALYTICAL SHEETS (API VERSION)
+# =============================================================================
+
+def write_seo_report_template_api(workbook) -> None:
+    """
+    Create an SEO Report Template sheet with blank sections for manual completion.
+    API version for use with create_excel_report().
+    """
+    from openpyxl.styles import Font, Alignment
+    from openpyxl.utils import get_column_letter
+
+    ws = workbook.create_sheet(title='SEO Report Template')
+
+    bold_font = Font(bold=True)
+    section_font = Font(bold=True, size=12)
+
+    # Header fields (rows 1-4)
+    header_fields = [('Company:', ''), ('Created by:', ''), ('Month/Year:', ''), ('Key Figures:', '')]
+    for row_idx, (label, value) in enumerate(header_fields, start=1):
+        ws.cell(row=row_idx, column=1, value=label).font = bold_font
+        ws.cell(row=row_idx, column=2, value=value)
+
+    # Section 1: Pages Report (row 6-32)
+    ws.cell(row=6, column=1, value='Section 1: Pages Report').font = section_font
+    pages_headers = ['Page', 'URL', 'Traffic This Month', 'Change From Last Month', 'Changes Made to the Page']
+    for col_idx, header in enumerate(pages_headers, start=1):
+        ws.cell(row=7, column=col_idx, value=header).font = bold_font
+
+    # Section 2: Top Keywords (row 35-61)
+    ws.cell(row=35, column=1, value='Section 2: Top Keywords').font = section_font
+    keywords_headers = ['Top Keywords', 'Rank', 'Change in Rank From Last Month', 'Volume', 'Difficulty (Ahrefs)']
+    for col_idx, header in enumerate(keywords_headers, start=1):
+        ws.cell(row=36, column=col_idx, value=header).font = bold_font
+
+    # Column widths
+    column_widths = {1: 30, 2: 50, 3: 22, 4: 25, 5: 30}
+    for col_num, width in column_widths.items():
+        ws.column_dimensions[get_column_letter(col_num)].width = width
+
+    ws.freeze_panes = 'A8'
+
+
+def build_content_to_optimize_api(df: pd.DataFrame) -> pd.DataFrame:
+    """Build Content to Optimize sheet - API version."""
+    mask = (df['status_code'] == 200) & (df['indexable'] == True)
+    candidates = df[mask].copy()
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Avg Position', 'Impressions', 'Clicks', 'CTR (%)',
+            'Word Count', 'Has Meta Description', 'Sessions', 'Optimization Signals', 'Priority Score'
+        ])
+
+    optimization_signals = []
+    priority_scores = []
+
+    for _, row in candidates.iterrows():
+        signals = []
+        score = 0
+
+        if row['impressions'] >= 100 and row['ctr'] < 0.05:
+            signals.append('Low CTR despite impressions')
+            score += 3
+        elif row['impressions'] >= 50 and row['ctr'] < 0.03:
+            signals.append('Very low CTR')
+            score += 4
+
+        if 5 <= row['avg_position'] <= 10:
+            signals.append('Position 5-10 (near page 1)')
+            score += 5
+        elif 11 <= row['avg_position'] <= 20:
+            signals.append('Position 11-20 (striking distance)')
+            score += 3
+
+        meta_desc = str(row.get('meta_description', '')).strip()
+        if not meta_desc:
+            signals.append('Missing meta description')
+            score += 2
+        elif len(meta_desc) < 70:
+            signals.append('Short meta description')
+            score += 1
+
+        if row['word_count'] < 500:
+            signals.append('Very thin content (<500 words)')
+            score += 3
+        elif row['word_count'] < 1000:
+            signals.append('Thin content (<1000 words)')
+            score += 2
+
+        if row['sessions'] > 0 and row['avg_position'] > 5:
+            signals.append('Has traffic, room to improve')
+            score += 1
+
+        if row['impressions'] >= 500:
+            signals.append('High search demand')
+            score += 2
+        elif row['impressions'] >= 100:
+            signals.append('Moderate search demand')
+            score += 1
+
+        optimization_signals.append('; '.join(signals) if signals else 'No specific signals')
+        priority_scores.append(score)
+
+    candidates['Optimization Signals'] = optimization_signals
+    candidates['Priority Score'] = priority_scores
+    candidates = candidates[candidates['Priority Score'] > 0]
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Avg Position', 'Impressions', 'Clicks', 'CTR (%)',
+            'Word Count', 'Has Meta Description', 'Sessions', 'Optimization Signals', 'Priority Score'
+        ])
+
+    candidates = candidates.sort_values('Priority Score', ascending=False)
+
+    return pd.DataFrame({
+        'URL': candidates['url'],
+        'Page Type': candidates['page_type'],
+        'Avg Position': candidates['avg_position'].round(1),
+        'Impressions': candidates['impressions'].astype(int),
+        'Clicks': candidates['clicks'].astype(int),
+        'CTR (%)': (candidates['ctr'] * 100).round(2),
+        'Word Count': candidates['word_count'].astype(int),
+        'Has Meta Description': candidates['meta_description'].apply(lambda x: 'Yes' if str(x).strip() else 'No'),
+        'Sessions': candidates['sessions'].astype(int),
+        'Optimization Signals': candidates['Optimization Signals'],
+        'Priority Score': candidates['Priority Score']
+    })
+
+
+def build_thin_content_api(df: pd.DataFrame, thin_threshold: int = 1000) -> pd.DataFrame:
+    """Build Thin Content Opportunities sheet - API version."""
+    mask = (df['status_code'] == 200) & (df['indexable'] == True) & (df['word_count'] < thin_threshold)
+    candidates = df[mask].copy()
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Word Count', 'Content Gap', 'Sessions',
+            'Impressions', 'Avg Position', 'Referring Domains', 'Opportunity Type', 'Value Score'
+        ])
+
+    opportunity_types = []
+    value_scores = []
+
+    for _, row in candidates.iterrows():
+        opp_type = []
+        score = 0
+
+        if row['sessions'] >= 10:
+            opp_type.append('Has significant traffic')
+            score += 5
+        elif row['sessions'] > 0:
+            opp_type.append('Has some traffic')
+            score += 2
+
+        if row['impressions'] >= 100:
+            opp_type.append('High search visibility')
+            score += 4
+        elif row['impressions'] > 0:
+            opp_type.append('Some search visibility')
+            score += 1
+
+        if 0 < row['avg_position'] <= 20:
+            opp_type.append('Already ranking (pos <= 20)')
+            score += 3
+        elif 20 < row['avg_position'] <= 50:
+            opp_type.append('Has rankings (pos 20-50)')
+            score += 1
+
+        if row['referring_domains'] >= 5:
+            opp_type.append('Strong backlink profile')
+            score += 4
+        elif row['referring_domains'] > 0:
+            opp_type.append('Has backlinks')
+            score += 2
+
+        if row['page_type'] in ['Service', 'Local Lander', 'Home']:
+            opp_type.append(f'Strategic page ({row["page_type"]})')
+            score += 3
+
+        if row['word_count'] < 300:
+            opp_type.append('Severely thin (<300 words)')
+        elif row['word_count'] < 500:
+            opp_type.append('Very thin (<500 words)')
+
+        opportunity_types.append('; '.join(opp_type) if opp_type else 'Low priority')
+        value_scores.append(score)
+
+    candidates['Opportunity Type'] = opportunity_types
+    candidates['Value Score'] = value_scores
+    candidates = candidates[candidates['Value Score'] > 0]
+
+    if len(candidates) == 0:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Word Count', 'Content Gap', 'Sessions',
+            'Impressions', 'Avg Position', 'Referring Domains', 'Opportunity Type', 'Value Score'
+        ])
+
+    candidates = candidates.sort_values('Value Score', ascending=False)
+    content_gap = thin_threshold - candidates['word_count']
+
+    return pd.DataFrame({
+        'URL': candidates['url'],
+        'Page Type': candidates['page_type'],
+        'Word Count': candidates['word_count'].astype(int),
+        'Content Gap': content_gap.astype(int),
+        'Sessions': candidates['sessions'].astype(int),
+        'Impressions': candidates['impressions'].astype(int),
+        'Avg Position': candidates['avg_position'].round(1),
+        'Referring Domains': candidates['referring_domains'].astype(int),
+        'Opportunity Type': candidates['Opportunity Type'],
+        'Value Score': candidates['Value Score']
+    })
+
+
+def build_new_content_opportunities_api(df: pd.DataFrame) -> pd.DataFrame:
+    """Build New Content Opportunities sheet - API version."""
+    opportunities = []
+
+    # Intent mismatch
+    intent_mismatch = df[(df['status_code'] == 200) & (df['impressions'] >= 100) & (df['clicks'] < 5) & (df['ctr'] < 0.02)].copy()
+    for _, row in intent_mismatch.iterrows():
+        opportunities.append({
+            'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': row.get('primary_keyword', ''),
+            'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
+            'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
+            'Referring Domains': int(row['referring_domains']),
+            'Opportunity Type': 'Intent mismatch - create better content for query',
+            'Value Score': min(10, int(row['impressions'] / 50) + 3)
+        })
+
+    # Wasted authority
+    wasted_authority = df[(df['status_code'] == 200) & (df['referring_domains'] >= 3) & (df['sessions'] == 0) & (df['impressions'] < 50)].copy()
+    for _, row in wasted_authority.iterrows():
+        opportunities.append({
+            'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': row.get('primary_keyword', ''),
+            'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
+            'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
+            'Referring Domains': int(row['referring_domains']),
+            'Opportunity Type': 'Wasted authority - optimize or redirect',
+            'Value Score': min(10, int(row['referring_domains']) + 2)
+        })
+
+    # Deep rankings
+    deep_rankings = df[(df['status_code'] == 200) & (df['avg_position'] > 20) & (df['avg_position'] <= 50) & (df['impressions'] >= 50)].copy()
+    for _, row in deep_rankings.iterrows():
+        keyword = str(row.get('primary_keyword', '')).strip()
+        if keyword:
+            opportunities.append({
+                'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': keyword,
+                'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
+                'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
+                'Referring Domains': int(row['referring_domains']),
+                'Opportunity Type': f'Create dedicated content for: {keyword[:50]}',
+                'Value Score': max(1, 8 - int((row['avg_position'] - 20) / 5))
+            })
+
+    # Strategic gaps
+    strategic_gaps = df[(df['status_code'] == 200) & (df['page_type'].isin(['Service', 'Local Lander'])) & (df['word_count'] < 500) & (df['sessions'] == 0)].copy()
+    for _, row in strategic_gaps.iterrows():
+        opportunities.append({
+            'URL': row['url'], 'Page Type': row['page_type'], 'Primary Keyword': row.get('primary_keyword', ''),
+            'Impressions': int(row['impressions']), 'Clicks': int(row['clicks']),
+            'Avg Position': round(row['avg_position'], 1), 'Sessions': int(row['sessions']),
+            'Referring Domains': int(row['referring_domains']),
+            'Opportunity Type': f'Strategic page needs content ({row["page_type"]})',
+            'Value Score': 6
+        })
+
+    if not opportunities:
+        return pd.DataFrame(columns=[
+            'URL', 'Page Type', 'Primary Keyword', 'Impressions', 'Clicks',
+            'Avg Position', 'Sessions', 'Referring Domains', 'Opportunity Type', 'Value Score'
+        ])
+
+    result = pd.DataFrame(opportunities)
+    result = result.sort_values('Value Score', ascending=False)
+    result = result.drop_duplicates(subset=['URL'], keep='first')
+    return result.sort_values('Value Score', ascending=False)
+
+
+def write_analytical_sheets_api(workbook, df: pd.DataFrame, thin_content_threshold: int = 1000) -> None:
+    """Write analytical insight sheets to workbook - API version."""
+    from openpyxl.styles import Font, PatternFill
+
+    header_font = Font(bold=True)
+    header_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+
+    # Sheet 1: Content to Optimize
+    content_df = build_content_to_optimize_api(df)
+    ws1 = workbook.create_sheet(title='Content to Optimize')
+
+    if len(content_df) > 0:
+        for col_idx, col_name in enumerate(content_df.columns, start=1):
+            cell = ws1.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+        for row_idx, row in enumerate(content_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws1.cell(row=row_idx, column=col_idx, value=value)
+        ws1.column_dimensions['A'].width = 60
+        ws1.column_dimensions['J'].width = 50
+    else:
+        ws1.cell(row=1, column=1, value='No content optimization opportunities found')
+    ws1.freeze_panes = 'A2'
+    logger.info(f"Wrote Content to Optimize sheet: {len(content_df)} rows")
+
+    # Sheet 2: Thin Content Opportunities
+    thin_df = build_thin_content_api(df, thin_content_threshold)
+    ws2 = workbook.create_sheet(title='Thin Content Opportunities')
+
+    if len(thin_df) > 0:
+        for col_idx, col_name in enumerate(thin_df.columns, start=1):
+            cell = ws2.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+        for row_idx, row in enumerate(thin_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws2.cell(row=row_idx, column=col_idx, value=value)
+        ws2.column_dimensions['A'].width = 60
+        ws2.column_dimensions['I'].width = 50
+    else:
+        ws2.cell(row=1, column=1, value='No thin content opportunities found')
+    ws2.freeze_panes = 'A2'
+    logger.info(f"Wrote Thin Content Opportunities sheet: {len(thin_df)} rows")
+
+    # Sheet 3: New Content Opportunities
+    new_content_df = build_new_content_opportunities_api(df)
+    ws3 = workbook.create_sheet(title='New Content Opportunities')
+
+    if len(new_content_df) > 0:
+        for col_idx, col_name in enumerate(new_content_df.columns, start=1):
+            cell = ws3.cell(row=1, column=col_idx, value=col_name)
+            cell.font = header_font
+            cell.fill = header_fill
+        for row_idx, row in enumerate(new_content_df.itertuples(index=False), start=2):
+            for col_idx, value in enumerate(row, start=1):
+                ws3.cell(row=row_idx, column=col_idx, value=value)
+        ws3.column_dimensions['A'].width = 60
+        ws3.column_dimensions['I'].width = 50
+    else:
+        ws3.cell(row=1, column=1, value='No new content opportunities found')
+    ws3.freeze_panes = 'A2'
+    logger.info(f"Wrote New Content Opportunities sheet: {len(new_content_df)} rows")
+
+
 def create_excel_report(
     df: pd.DataFrame,
     summaries: Dict[str, pd.DataFrame],
@@ -1766,6 +2113,13 @@ def create_excel_report(
                                     startrow=current_row)
 
             logger.info(f"Wrote Data Quality sheet: {len(quality_report.issues)} issues found")
+
+        # Sheet 5: SEO Report Template (blank template for manual completion)
+        write_seo_report_template_api(workbook)
+        logger.info("Wrote SEO Report Template sheet")
+
+        # Sheets 6-8: Analytical Insight Sheets
+        write_analytical_sheets_api(workbook, df, thin_content_threshold=1000)
 
     output.seek(0)
     return output.getvalue()
