@@ -1,0 +1,8 @@
+[project]
+name = "wqa-engine"
+version = "0.1.0"
+description = "Enhanced WQA engine - modular port of api/index.py"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

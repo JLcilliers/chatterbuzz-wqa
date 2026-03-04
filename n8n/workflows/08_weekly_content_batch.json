@@ -1,0 +1,22 @@
+{
+  "name": "08 - Weekly Content Batch",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 6 * * 2" }] } },
+      "name": "Cron - Tuesday 06:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/content-batch/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger Content Batch",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - Tuesday 06:00 UTC": { "main": [[{ "node": "Trigger Content Batch", "type": "main", "index": 0 }]] } }
+}

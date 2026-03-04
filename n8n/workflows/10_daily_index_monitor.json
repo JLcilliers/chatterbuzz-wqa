@@ -1,0 +1,22 @@
+{
+  "name": "10 - Daily Index Monitor",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 12 * * *" }] } },
+      "name": "Cron - Daily 12:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/index-monitor/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger Index Monitor",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - Daily 12:00 UTC": { "main": [[{ "node": "Trigger Index Monitor", "type": "main", "index": 0 }]] } }
+}

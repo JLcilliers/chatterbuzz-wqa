@@ -1,0 +1,8 @@
+[project]
+name = "data-pipeline"
+version = "0.1.0"
+description = "Data ingestion pipeline workers for GA4, GSC, crawl, backlink, GBP"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

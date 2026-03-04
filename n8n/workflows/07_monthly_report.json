@@ -1,0 +1,22 @@
+{
+  "name": "07 - Monthly Report",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 6 28 * *" }] } },
+      "name": "Cron - 28th 06:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/monthly-report/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger Monthly Report",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - 28th 06:00 UTC": { "main": [[{ "node": "Trigger Monthly Report", "type": "main", "index": 0 }]] } }
+}

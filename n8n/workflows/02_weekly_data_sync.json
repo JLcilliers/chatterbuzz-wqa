@@ -1,0 +1,22 @@
+{
+  "name": "02 - Weekly GA4+GBP+Backlinks Sync",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 2 * * 0" }] } },
+      "name": "Cron - Sunday 02:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/ga4-sync/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger GA4+GBP+Backlinks",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - Sunday 02:00 UTC": { "main": [[{ "node": "Trigger GA4+GBP+Backlinks", "type": "main", "index": 0 }]] } }
+}

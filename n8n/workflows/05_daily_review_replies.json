@@ -1,0 +1,22 @@
+{
+  "name": "05 - Daily Review Replies",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 * * *" }] } },
+      "name": "Cron - Daily 09:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/review-replies/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger Review Replies",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - Daily 09:00 UTC": { "main": [[{ "node": "Trigger Review Replies", "type": "main", "index": 0 }]] } }
+}

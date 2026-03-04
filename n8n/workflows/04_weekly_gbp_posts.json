@@ -1,0 +1,22 @@
+{
+  "name": "04 - Weekly GBP Posts",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 8 * * 1" }] } },
+      "name": "Cron - Monday 08:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/gbp-posts/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger GBP Posts",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - Monday 08:00 UTC": { "main": [[{ "node": "Trigger GBP Posts", "type": "main", "index": 0 }]] } }
+}

@@ -1,0 +1,8 @@
+[project]
+name = "schema-generator"
+version = "0.1.0"
+description = "JSON-LD schema markup generator"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -31,6 +31,13 @@ try:
 except ImportError:
     GOOGLE_OAUTH_AVAILABLE = False
 
+# Anthropic AI imports
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -58,6 +65,7 @@ GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.environ.get("GOOGLE_REDIRECT_URI", "")
 SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # OAuth scopes needed for GA4 and GSC
 GOOGLE_SCOPES = [
@@ -1268,6 +1276,96 @@ def assign_priority(row) -> str:
     return 'Low'
 
 
+async def generate_ai_recommendations(df: pd.DataFrame) -> List[str]:
+    """
+    Generate AI-powered strategic recommendations for each URL using Claude Haiku.
+
+    Processes URLs in batches of 20, caps at 500 URLs (ranked by sessions + impressions).
+    Returns a list of recommendation strings aligned to the DataFrame index.
+    Falls back to empty strings on any error.
+    """
+    if not ANTHROPIC_AVAILABLE or not ANTHROPIC_API_KEY:
+        logger.warning("AI recommendations skipped: Anthropic not available or API key not set")
+        return [''] * len(df)
+
+    try:
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    except Exception as e:
+        logger.error(f"Failed to initialize Anthropic client: {e}")
+        return [''] * len(df)
+
+    recommendations = [''] * len(df)
+
+    # Rank URLs by importance (sessions + impressions) and cap at 500
+    df_work = df.copy()
+    df_work['_importance'] = (
+        pd.to_numeric(df_work.get('sessions', pd.Series(dtype=float)), errors='coerce').fillna(0) +
+        pd.to_numeric(df_work.get('impressions', pd.Series(dtype=float)), errors='coerce').fillna(0)
+    )
+    top_indices = df_work.nlargest(500, '_importance').index.tolist()
+
+    BATCH_SIZE = 20
+    batches = [top_indices[i:i + BATCH_SIZE] for i in range(0, len(top_indices), BATCH_SIZE)]
+
+    for batch_indices in batches:
+        try:
+            # Build context for this batch
+            url_entries = []
+            for idx_num, idx in enumerate(batch_indices):
+                row = df.iloc[idx]
+                url_entries.append(
+                    f"[{idx_num}] URL: {row.get('url', '')}\n"
+                    f"    Title: {row.get('page_title', '')}\n"
+                    f"    Meta: {str(row.get('meta_description', ''))[:150]}\n"
+                    f"    Sessions: {row.get('sessions', 0)} | Impressions: {row.get('impressions', 0)} | "
+                    f"CTR: {row.get('ctr', '')} | Position: {row.get('avg_position', '')}\n"
+                    f"    Word Count: {row.get('word_count', 0)} | Status: {row.get('status_code', '')}\n"
+                    f"    Tech Actions: {row.get('technical_actions', '')} | "
+                    f"Content Actions: {row.get('content_actions', '')}"
+                )
+
+            prompt = (
+                "You are an expert SEO strategist. For each URL below, provide a 1-2 sentence "
+                "strategic recommendation that goes beyond the existing rule-based actions. "
+                "Focus on content strategy, user intent, competitive positioning, or conversion optimization.\n\n"
+                "Format your response EXACTLY as:\n"
+                "[0] Your recommendation here\n"
+                "[1] Your recommendation here\n"
+                "...and so on for each URL.\n\n"
+                + "\n\n".join(url_entries)
+            )
+
+            response = await client.messages.create(
+                model="claude-haiku-4-20250414",
+                max_tokens=2048,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            # Parse response
+            response_text = response.content[0].text
+            for line in response_text.strip().split('\n'):
+                line = line.strip()
+                if line.startswith('[') and ']' in line:
+                    try:
+                        bracket_end = line.index(']')
+                        local_idx = int(line[1:bracket_end])
+                        rec_text = line[bracket_end + 1:].strip()
+                        if rec_text.startswith('-'):
+                            rec_text = rec_text[1:].strip()
+                        if 0 <= local_idx < len(batch_indices):
+                            recommendations[batch_indices[local_idx]] = rec_text
+                    except (ValueError, IndexError):
+                        continue
+
+        except Exception as e:
+            logger.warning(f"AI recommendation batch failed: {e}")
+            continue
+
+    filled = sum(1 for r in recommendations if r)
+    logger.info(f"AI recommendations generated: {filled}/{len(df)} URLs")
+    return recommendations
+
+
 def determine_final_url(row) -> str:
     """
     Determine Final URL for pages that need redirecting/merging.
@@ -1348,6 +1446,16 @@ def generate_summary(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     status_counts.columns = ['Status Code', 'Count']
     status_counts = status_counts.sort_values('Status Code')
     summaries['status_code'] = status_counts
+
+    # AI recommendation coverage
+    if 'ai_recommendation' in df.columns:
+        ai_with = sum(1 for v in df['ai_recommendation'] if v and str(v).strip())
+        ai_without = len(df) - ai_with
+        ai_coverage = pd.DataFrame({
+            'AI Recommendations': ['With AI Recommendation', 'Without AI Recommendation'],
+            'Count': [ai_with, ai_without]
+        })
+        summaries['ai_recommendations'] = ai_coverage
 
     return summaries
 
@@ -2869,7 +2977,8 @@ def create_excel_report(
         16: 'ENGAGEMENT', 17: '',
         18: 'CONVERSIONS', 19: '', 20: '', 21: '',
         22: 'ON PAGE', 23: '', 24: '', 25: '', 26: '', 27: '', 28: '', 29: '', 30: '',
-        31: 'TECHNICAL', 32: '', 33: '', 34: '', 35: '', 36: '', 37: ''
+        31: 'TECHNICAL', 32: '', 33: '', 34: '', 35: '', 36: '', 37: '',
+        38: 'AI'
     }
 
     # Row 2: Source labels
@@ -2880,7 +2989,8 @@ def create_excel_report(
         16: 'GA', 17: 'GA',
         18: 'GA', 19: 'GA', 20: 'GA', 21: 'GA',
         22: 'SF', 23: 'SF', 24: 'GSC', 25: 'SF', 26: 'SF', 27: 'SF', 28: 'SF', 29: 'SF', 30: 'Ahrefs',
-        31: 'SF', 32: 'SF', 33: 'SF', 34: 'SF', 35: 'SF', 36: 'Formula', 37: 'SF'
+        31: 'SF', 32: 'SF', 33: 'SF', 34: 'SF', 35: 'SF', 36: 'Formula', 37: 'SF',
+        38: 'Claude'
     }
 
     # Row 3: Column names
@@ -2891,7 +3001,8 @@ def create_excel_report(
         'Bounce rate (%)', 'Average session duration',
         'Conversions (All Goals)', 'Conversion Rate (%)', 'Ecom Revenue Generated', 'Ecom Conversion Rate',
         'Type', 'Current Title', 'SERP CTR', 'Meta', 'H1', 'Word Count', 'Inlinks', 'Outlinks', 'DOFOLLOW Links',
-        'Canonical Link Element', 'Status Code', 'Index / Noindex', 'Indexation Status', 'Page Depth', 'In Sitemap?', 'Last Modified'
+        'Canonical Link Element', 'Status Code', 'Index / Noindex', 'Indexation Status', 'Page Depth', 'In Sitemap?', 'Last Modified',
+        'AI Recommendation'
     ]
 
     # Build data rows
@@ -2977,6 +3088,7 @@ def create_excel_report(
             row.get('crawl_depth', ''),                         # 35: Page Depth
             in_sitemap,                                         # 36: In Sitemap?
             row.get('last_modified', ''),                       # 37: Last Modified
+            row.get('ai_recommendation', ''),                   # 38: AI Recommendation
         ]
         data_rows.append(data_row)
 
@@ -3000,6 +3112,7 @@ def create_excel_report(
             ('S1:V1', 'CONVERSIONS', 'BF8F00'),         # Dark Gold
             ('W1:AE1', 'ON PAGE', '385723'),            # Forest Green
             ('AF1:AL1', 'TECHNICAL', '833C0C'),         # Dark Brown
+            ('AM1:AM1', 'AI', '1A73E8'),               # Google Blue
         ]
 
         from openpyxl.styles import Font, PatternFill, Alignment
@@ -3116,8 +3229,8 @@ def create_excel_report(
             # Set reasonable default widths based on column type
             if col_name in ['URL', 'Canonical Link Element', 'Meta', 'Current Title']:
                 worksheet.column_dimensions[col_letter].width = 50
-            elif col_name in ['page-path', 'Final URL', 'H1']:
-                worksheet.column_dimensions[col_letter].width = 35
+            elif col_name in ['page-path', 'Final URL', 'H1', 'AI Recommendation']:
+                worksheet.column_dimensions[col_letter].width = 45
             elif col_name in ['Technical Action', 'Content Action', 'Category', 'Indexation Status']:
                 worksheet.column_dimensions[col_letter].width = 20
             else:
@@ -3134,6 +3247,7 @@ def create_excel_report(
             ('Content Actions', 'content_actions'),
             ('Page Types', 'page_type'),
             ('Status Codes', 'status_code'),
+            ('AI Recommendations', 'ai_recommendations'),
         ]
         for title, key in summary_order:
             if key in summaries:
@@ -3970,6 +4084,14 @@ async def root():
                 <h3>Thresholds</h3>
                 <div class="threshold-grid">
                     <div class="threshold-item">
+                        <label>Analysis Period</label>
+                        <select name="analysis_days">
+                            <option value="90" selected>3 Months (90 days)</option>
+                            <option value="180">6 Months (180 days)</option>
+                            <option value="365">12 Months (365 days)</option>
+                        </select>
+                    </div>
+                    <div class="threshold-item">
                         <label>Low Traffic (sessions)</label>
                         <input type="number" name="low_traffic_threshold" value="5" min="0">
                     </div>
@@ -3985,6 +4107,13 @@ async def root():
                         <label>Low CTR Threshold</label>
                         <input type="number" name="low_ctr_threshold" value="0.05" min="0" max="1" step="0.01">
                     </div>
+                    <div class="threshold-item" style="display: flex; align-items: center; gap: 8px;">
+                        <input type="checkbox" name="use_ai_actions" value="true" id="useAiActions" style="width: auto;">
+                        <label for="useAiActions" style="margin: 0; cursor: pointer;">AI Recommendations</label>
+                    </div>
+                </div>
+                <div class="helper-text" style="margin-top: 8px;">
+                    <strong>AI Recommendations:</strong> Adds strategic AI-powered recommendation column. Requires Anthropic API key. May add 20-30 seconds.
                 </div>
             </div>
 
@@ -4267,6 +4396,8 @@ async def generate_report(
     thin_content_threshold: int = Form(1000),
     high_rank_max_position: float = Form(20.0),
     low_ctr_threshold: float = Form(0.05),
+    analysis_days: int = Form(90),
+    use_ai_actions: str = Form("false"),
     use_ga4_api: str = Form("false"),
     ga4_property_id: str = Form(""),
     use_gsc_api: str = Form("false"),
@@ -4275,6 +4406,11 @@ async def generate_report(
 ):
     """Generate WQA report from uploaded CSV/Excel files or Google API data"""
     try:
+        # Validate analysis_days
+        if analysis_days not in (90, 180, 365):
+            analysis_days = 90
+        logger.info(f"Analysis period: {analysis_days} days")
+
         # Read crawl file (required)
         crawl_content = await crawl_file.read()
         crawl_df = load_crawl_data(crawl_content, crawl_file.filename or "")
@@ -4286,7 +4422,7 @@ async def generate_report(
             tokens = decrypt_token(google_tokens)
             if tokens:
                 credentials = get_credentials_from_tokens(tokens)
-                ga_df = await fetch_ga4_report(credentials, ga4_property_id)
+                ga_df = await fetch_ga4_report(credentials, ga4_property_id, days=analysis_days)
                 logger.info(f"Loaded GA4 data from API: {len(ga_df)} rows")
         elif ga_file and ga_file.filename:
             ga_content = await ga_file.read()
@@ -4304,10 +4440,10 @@ async def generate_report(
             if tokens:
                 credentials = get_credentials_from_tokens(tokens)
                 # Fetch page-level data for URL merging
-                gsc_df = await fetch_gsc_report(credentials, gsc_site_url)
+                gsc_df = await fetch_gsc_report(credentials, gsc_site_url, days=analysis_days)
                 logger.info(f"Loaded GSC page-level data from API: {len(gsc_df)} rows")
                 # Fetch query-level data for topic clustering
-                gsc_query_df = await fetch_gsc_query_data(credentials, gsc_site_url)
+                gsc_query_df = await fetch_gsc_query_data(credentials, gsc_site_url, days=analysis_days)
                 logger.info(f"Loaded GSC query-level data from API: {len(gsc_query_df)} rows")
         elif gsc_file and gsc_file.filename:
             gsc_content = await gsc_file.read()
@@ -4368,6 +4504,14 @@ async def generate_report(
         # Determine Final URL for redirects/merges
         df['final_url'] = df.apply(determine_final_url, axis=1)
 
+        # Generate AI recommendations if enabled
+        if use_ai_actions == "true":
+            logger.info("AI recommendations enabled, generating...")
+            ai_recs = await generate_ai_recommendations(df)
+            df['ai_recommendation'] = ai_recs
+        else:
+            df['ai_recommendation'] = ''
+
         # Generate summary
         summaries = generate_summary(df)
 
@@ -4378,6 +4522,17 @@ async def generate_report(
         high_issues = sum(1 for i in quality_report.issues if i['severity'] == 'High')
         if high_issues > 0:
             logger.warning(f"ATTENTION: {high_issues} high-severity data quality issues found!")
+
+        # Warn if AI was enabled but produced no results
+        if use_ai_actions == "true":
+            ai_filled = sum(1 for v in df['ai_recommendation'] if v and str(v).strip())
+            if ai_filled == 0:
+                quality_report.add_issue(
+                    category='AI Recommendations',
+                    severity='Medium',
+                    description='AI recommendations were enabled but none were generated. Check that ANTHROPIC_API_KEY is set and valid.',
+                    affected_count=len(df)
+                )
 
         # Create Excel report with data quality sheet
         # Pass gsc_query_df for topic clustering in analytical sheets

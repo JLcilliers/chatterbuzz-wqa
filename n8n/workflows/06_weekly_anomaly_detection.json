@@ -1,0 +1,22 @@
+{
+  "name": "06 - Weekly Anomaly Detection",
+  "nodes": [
+    {
+      "parameters": { "rule": { "interval": [{ "field": "cronExpression", "expression": "0 10 * * 5" }] } },
+      "name": "Cron - Friday 10:00 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{$env.API_BASE_URL}}/webhooks/anomaly-detection/{{$env.CLIENT_ID}}",
+        "method": "POST",
+        "headerParameters": { "parameters": [{ "name": "X-API-Key", "value": "={{$env.API_SECRET_KEY}}" }] }
+      },
+      "name": "Trigger Anomaly Detection",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [500, 300]
+    }
+  ],
+  "connections": { "Cron - Friday 10:00 UTC": { "main": [[{ "node": "Trigger Anomaly Detection", "type": "main", "index": 0 }]] } }
+}
