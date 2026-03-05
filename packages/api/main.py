@@ -17,6 +17,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:3001",
+        "https://chatterbuzz-web.vercel.app",
+        "https://chatterbuzz-dashboard.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],

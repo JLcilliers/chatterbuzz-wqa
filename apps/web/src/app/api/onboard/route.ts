@@ -114,6 +114,23 @@ export async function POST(req: NextRequest) {
     // Update client status to active
     await supabase.from('clients').update({ status: 'active' }).eq('id', clientId);
 
+    // Trigger initial pipeline run via FastAPI gateway
+    const apiUrl = process.env.NEXT_PUBLIC_API_URL;
+    const apiKey = process.env.API_SECRET_KEY;
+    if (apiUrl && apiKey) {
+      try {
+        await fetch(`${apiUrl}/pipeline/${clientId}/run`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': apiKey,
+          },
+        });
+      } catch (pipelineError) {
+        console.error('Pipeline trigger failed (non-blocking):', pipelineError);
+      }
+    }
+
     return NextResponse.json({ success: true, clientId });
   } catch (error) {
     console.error('Onboarding error:', error);
