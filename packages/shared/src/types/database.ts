@@ -230,28 +230,35 @@ export interface IndexStatus {
   created_at: string;
 }
 
+// Helper: make all fields optional for Insert/Update
+type TableDef<T> = { Row: T; Insert: Partial<T>; Update: Partial<T>; Relationships: [] };
+
 // Database schema aggregate type
 export interface Database {
   public: {
     Tables: {
-      clients: { Row: Client };
-      client_api_credentials: { Row: ClientApiCredential };
-      business_rules: { Row: BusinessRule };
-      crawl_runs: { Row: CrawlRun };
-      crawl_data: { Row: CrawlData };
-      ga4_data: { Row: GA4Data };
-      gsc_data: { Row: GSCData };
-      gbp_data: { Row: GBPData };
-      backlink_data: { Row: BacklinkData };
-      wqa_results: { Row: WQAResult };
-      keyword_clusters: { Row: KeywordCluster };
-      content_queue: { Row: ContentQueueItem };
-      content_templates: { Row: ContentTemplate };
-      schema_markup: { Row: SchemaMarkup };
-      asana_tasks: { Row: AsanaTask };
-      monthly_reports: { Row: MonthlyReport };
-      pipeline_runs: { Row: PipelineRun };
-      index_status: { Row: IndexStatus };
+      clients: TableDef<Client>;
+      client_api_credentials: TableDef<ClientApiCredential>;
+      business_rules: TableDef<BusinessRule>;
+      crawl_runs: TableDef<CrawlRun>;
+      crawl_data: TableDef<CrawlData>;
+      ga4_data: TableDef<GA4Data>;
+      gsc_data: TableDef<GSCData>;
+      gbp_data: TableDef<GBPData>;
+      backlink_data: TableDef<BacklinkData>;
+      wqa_results: TableDef<WQAResult>;
+      keyword_clusters: TableDef<KeywordCluster>;
+      content_queue: TableDef<ContentQueueItem>;
+      content_templates: TableDef<ContentTemplate>;
+      schema_markup: TableDef<SchemaMarkup>;
+      asana_tasks: TableDef<AsanaTask>;
+      monthly_reports: TableDef<MonthlyReport>;
+      pipeline_runs: TableDef<PipelineRun>;
+      index_status: TableDef<IndexStatus>;
     };
+    Views: Record<string, never>;
+    Functions: Record<string, never>;
+    Enums: Record<string, never>;
+    CompositeTypes: Record<string, never>;
   };
 }
