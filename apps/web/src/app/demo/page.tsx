@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useCallback } from 'react';
+import Link from 'next/link';
 
 // ── Mock Data ──────────────────────────────────────────────────────────────
 
@@ -205,13 +206,22 @@ export default function DemoPage() {
               ))}
             </div>
 
-            <div className="text-center pt-4">
+            <div className="text-center pt-4 flex gap-4 justify-center">
               <button
                 onClick={() => goTo('onboarding')}
                 className="px-8 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg font-medium text-lg transition"
               >
                 Start Walkthrough
               </button>
+              <Link
+                href="/demo/autoplay"
+                className="px-8 py-3 bg-purple-600 hover:bg-purple-700 rounded-lg font-medium text-lg transition inline-flex items-center gap-2"
+              >
+                <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+                  <path d="M6.3 2.84A1.5 1.5 0 004 4.11v11.78a1.5 1.5 0 002.3 1.27l9.344-5.891a1.5 1.5 0 000-2.538L6.3 2.841z" />
+                </svg>
+                Autoplay Demo
+              </Link>
             </div>
 
             <Card title="Tech Stack">
